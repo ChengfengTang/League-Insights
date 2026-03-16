@@ -2,6 +2,9 @@
 matches/
 timelines/
 
+# Live tracker output
+Live/live_records.json
+
 # Python
 __pycache__/
 *.py[cod]

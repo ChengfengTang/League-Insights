@@ -125,11 +125,10 @@ Real-time game monitoring system that visually watches the minimap and provides 
 ### Live
 - **Language**: Python
 - **Data Sources**: Visual minimap monitoring (screen capture/computer vision) - no Riot API
-- **Computer Vision**: Screen capture and minimap analysis to detect jungler positions
-- **Model Integration**: Loads trained models from `Predict/models/`
-- **Real-time Processing**: Continuous minimap monitoring and coordinate capture
-- **Data Collection**: Captured positions can be used as training data
-- **Framework**: (To be determined - likely OpenCV, PIL, or similar for screen capture)
+- **Libraries**: mss (screen capture), OpenCV (minimap analysis), numpy, openai (for AI assistant)
+- **Scripts**: `live_monitor.py` (capture + prediction), `assistant.py` (text chat with AI)
+- **Model Integration**: Loads trained models from `Predict/models/` for live predictions
+- **Data Collection**: Records saved to `Live/live_captures.json`
 
 ## 🔧 Setup
 
@@ -183,32 +182,21 @@ Each module has its own **`requirements.txt`** so you only install what you need
    pip install -r Live/requirements.txt
    ```
    (Uses `mss` for screen capture, `opencv-python-headless` for blob detection.)
-3. Ensure Predict module has trained models in `Predict/models/` directory
-4. Configure live game monitoring:
-   - Set up minimap screen capture region
-   - Configure jungler detection parameters
-   - No Riot API needed - purely visual monitoring
-5. (Optional) Calibrate minimap region: run `python -m Live.calibrate` from project root; it saves `Live/minimap_calibrate.png`. Adjust `Live/config.py` (DEFAULT_MINIMAP) or use `--left`, `--top`, `--width`, `--height` when running the monitor.
-6. Run the live monitor (from project root):
+2. Ensure Predict module has trained models in `Predict/models/` directory (optional, for predictions).
+3. (Optional) Calibrate minimap region: run `python -m Live.calibrate` from project root; it saves `Live/minimap_calibrate.png`. Adjust `Live/config.py` (DEFAULT_MINIMAP) or use `--left`, `--top`, `--width`, `--height` when running the monitor.
+4. Run the live monitor (from project root):
    ```bash
-   pip install -r Live/requirements.txt
    python -m Live.live_monitor
    ```
    Use `--no-predict` to only record positions; `--predictor lstm` or `--predictor tree` to choose model. Captures are saved to `Live/live_captures.json`.
-   The monitor will:
-   - Capture the minimap region and detect enemy (red) champion blobs
-   - Map pixel positions to in-game coordinates (same scale as Riot API: 0–14820 x, 0–14881 y)
-   - Record positions to `Live/live_captures.json` for training data
-   - Optionally load LSTM or tree models from `Predict/models/` and print predicted jungler location (30s ahead)
 
 **AI Assistant (text chat with live context)**  
-From project root, with an OpenAI-compatible API (OpenAI or local e.g. Ollama):
+With an OpenAI-compatible API (OpenAI or local e.g. Ollama):
    ```bash
-   pip install -r Live/requirements.txt
    export OPENAI_API_KEY="your-key"   # or for Ollama: export OPENAI_BASE_URL="http://localhost:11434/v1"
    python -m Live.assistant
    ```
-   Then type in the terminal: e.g. "I'm playing mid Ahri" or "Where is their jungler?" The AI sees game time, last minimap positions, and the model’s predicted jungler position. Use `quit` or `exit` to stop; `clear` to clear conversation context. Optional: `OPENAI_MODEL` (default `gpt-4o-mini`).
+   Type in the terminal: e.g. "I'm playing mid Ahri" or "Where is their jungler?" Use `quit` or `exit` to stop; `clear` to clear context. Optional: `OPENAI_MODEL` (default `gpt-4o-mini`).
 
 ## 📝 Notes
 
@@ -221,5 +209,3 @@ From project root, with an OpenAI-compatible API (OpenAI or local e.g. Ollama):
 - Model inference API in Replay will read model artifacts from Predict (to be implemented).
 - Live module provides real-time predictions during active games, while Replay visualizes completed matches.
 
-## 💬 Credits
-Built by: Chengfeng Tang
