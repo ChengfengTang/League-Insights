@@ -43,7 +43,7 @@ Real-time game monitoring system that visually watches the minimap and provides 
 - **Jungler Detection**: Detects when the jungler appears on the minimap and captures coordinates
 - **Position Data Collection**: Records captured position information for training data
 - **Model Inference Engine**: Loads trained models from `Predict/models/` for live predictions
-- **Real-time Prediction API**: Provides live-time jungler path predictions as the game progresses
+- **AI Assistant** (`assistant.py`): Text chat with an AI that sees game time, minimap positions, and model prediction—tell it what you're playing and ask for jungle-tracking help
 - **Data Pipeline**: Processes captured minimap data and feeds it into the trained ML model
 
 **Architecture:**
@@ -101,11 +101,11 @@ Real-time game monitoring system that visually watches the minimap and provides 
 - Visual minimap monitoring using screen capture/computer vision
 - Automatic jungler detection when they appear on the minimap
 - Real-time coordinate capture from minimap positions
+- **In-game AI assistant**: Text chat—tell the AI what you're playing; it sees time, minimap data, and the trained prediction and helps with jungle tracking (OpenAI or Ollama)
 - Captured position data used for training (counts as position info)
 - Continuous model inference using trained ML models
 - Real-time jungler path predictions as the game progresses
 - Integration with Predict module's trained models
-- Live prediction API for real-time game analysis
 
 ## 🛠️ Technical Stack
 
@@ -200,6 +200,15 @@ Each module has its own **`requirements.txt`** so you only install what you need
    - Map pixel positions to in-game coordinates (same scale as Riot API: 0–14820 x, 0–14881 y)
    - Record positions to `Live/live_captures.json` for training data
    - Optionally load LSTM or tree models from `Predict/models/` and print predicted jungler location (30s ahead)
+
+**AI Assistant (text chat with live context)**  
+From project root, with an OpenAI-compatible API (OpenAI or local e.g. Ollama):
+   ```bash
+   pip install -r Live/requirements.txt
+   export OPENAI_API_KEY="your-key"   # or for Ollama: export OPENAI_BASE_URL="http://localhost:11434/v1"
+   python -m Live.assistant
+   ```
+   Then type in the terminal: e.g. "I'm playing mid Ahri" or "Where is their jungler?" The AI sees game time, last minimap positions, and the model’s predicted jungler position. Use `quit` or `exit` to stop; `clear` to clear conversation context. Optional: `OPENAI_MODEL` (default `gpt-4o-mini`).
 
 ## 📝 Notes
 

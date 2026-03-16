@@ -1,3 +1,4 @@
 mss
 numpy
 opencv-python-headless
+openai
