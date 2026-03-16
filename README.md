@@ -133,32 +133,33 @@ Real-time game monitoring system that visually watches the minimap and provides 
 
 ## 🔧 Setup
 
+Each module has its own **`requirements.txt`** so you only install what you need (Replay = web only; Predict = ML; Live = minimap capture + optional Predict models). Run `pip install -r <Module>/requirements.txt` from the project root or from inside that module’s directory.
+
 ### Prerequisites
 1. Get a Riot API key from [Riot Developer Portal](https://developer.riotgames.com/)
 2. Python 3.7+
 3. (Optional) MySQL - only needed if you want to use database features in Predict
 
 ### Replay Setup
-1. Navigate to the web application directory:
+1. Install dependencies (from project root or Replay directory):
    ```bash
-   cd Replay
+   pip install -r Replay/requirements.txt
    ```
-2. Install dependencies:
+2. Navigate to Replay and run the application:
    ```bash
-   pip install -r requirements.txt
+   cd Replay && python application.py
    ```
-3. Run the application:
-   ```bash
-   python application.py
-   ```
-4. Open your browser to `http://127.0.0.1:5000`
+3. Open your browser to `http://127.0.0.1:5000`
 
 ### Predict Setup
-1. Navigate to the ML project directory:
+1. Install dependencies (from project root or Predict directory):
+   ```bash
+   pip install -r Predict/requirements.txt
+   ```
+2. Navigate to the ML project directory:
    ```bash
    cd Predict
    ```
-2. Install dependencies (create `requirements.txt` as needed)
 3. Fetch training data:
    ```bash
    python topNPlayers.py  # Fetches top players
@@ -177,28 +178,28 @@ Real-time game monitoring system that visually watches the minimap and provides 
    - Model artifacts will be used by Live module for real-time predictions
 
 ### Live Setup
-1. Navigate to the live monitoring directory:
+1. From the project root, install Live dependencies:
    ```bash
-   cd Live
+   pip install -r Live/requirements.txt
    ```
-2. Install dependencies (create `requirements.txt` as needed)
-   - Screen capture libraries (e.g., PIL, mss, pyautogui)
-   - Computer vision libraries (e.g., OpenCV)
+   (Uses `mss` for screen capture, `opencv-python-headless` for blob detection.)
 3. Ensure Predict module has trained models in `Predict/models/` directory
 4. Configure live game monitoring:
    - Set up minimap screen capture region
    - Configure jungler detection parameters
    - No Riot API needed - purely visual monitoring
-5. Run the live monitor:
+5. (Optional) Calibrate minimap region: run `python -m Live.calibrate` from project root; it saves `Live/minimap_calibrate.png`. Adjust `Live/config.py` (DEFAULT_MINIMAP) or use `--left`, `--top`, `--width`, `--height` when running the monitor.
+6. Run the live monitor (from project root):
    ```bash
-   python live_monitor.py  # (To be implemented)
+   pip install -r Live/requirements.txt
+   python -m Live.live_monitor
    ```
-6. The system will:
-   - Visually watch the minimap in real-time
-   - Detect when jungler appears and capture coordinates
-   - Use captured position data for training (as position info)
-   - Feed real-time data into trained models from Predict
-   - Provide continuous jungler path predictions
+   Use `--no-predict` to only record positions; `--predictor lstm` or `--predictor tree` to choose model. Captures are saved to `Live/live_captures.json`.
+   The monitor will:
+   - Capture the minimap region and detect enemy (red) champion blobs
+   - Map pixel positions to in-game coordinates (same scale as Riot API: 0–14820 x, 0–14881 y)
+   - Record positions to `Live/live_captures.json` for training data
+   - Optionally load LSTM or tree models from `Predict/models/` and print predicted jungler location (30s ahead)
 
 ## 📝 Notes
 

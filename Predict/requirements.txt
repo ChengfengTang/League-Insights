@@ -1,0 +1,7 @@
+numpy
+pandas
+scikit-learn
+torch
+requests
+# Optional, for topNPlayers.py and fetchdata.py when using MySQL:
+# mysql-connector-python
