@@ -1,9 +1,14 @@
-# Match data directories
-matches/
-timelines/
+# Data directories
+Data/matches/
+Data/timelines/
+Data/players/
+Data/riotApiKey.txt
 
-# Live tracker output
-Live/live_records.json
+# Live 
+Live/
+
+# Predict
+Predict/
 
 # Python
 __pycache__/
@@ -37,3 +42,8 @@ ENV/
 .vscode/
 *.swp
 *.swo 
+
+# Environment / secrets
+.env
+.env.*
+!.env.example

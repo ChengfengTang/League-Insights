@@ -10,11 +10,12 @@ This repository is organized into three independent modules:
 ML pipeline for jungler path prediction and analysis.
 
 **Components:**
-- **Data Ingestion**: `topNPlayers.py` - Fetches top ranked players (Challenger, Grandmaster, Master) for training data collection
+- **Shared Data Ingestion**: `Data/fetchTopRankedPlayers.py` - Fetches top ranked players (Challenger, Grandmaster, Master) for training/replay data collection
 - **Timeline Parsing**: `AllInfo.py` - Match timeline analysis and data processing
 - **Data Fetching**: `fetchdata.py` - Riot API data fetching utilities
 - **Champion Categorization**: `TDchampCategory.py` - Categorizes champions by jungler playstyle (aggressive, full_clear, etc.)
 - **Model Training**: `TDpredict.py` - ML model training and prediction for enemy jungler location prediction
+- **YOLO champion icons** (`Predict/yolo/`): Download Data Dragon icons, synthetic YOLO dataset, train Ultralytics YOLOv8; `Live/yolo_detect.py` runs inference on minimap crops (see `Predict/yolo/README.md`)
 - **Model Artifacts**: (To be stored in `models/` directory)
 
 **Data Storage:**
@@ -155,20 +156,24 @@ Each module has its own **`requirements.txt`** so you only install what you need
    ```bash
    pip install -r Predict/requirements.txt
    ```
-2. Navigate to the ML project directory:
+2. Fill in your Riot API key in `.env.example` (`RIOT_API_KEY=...`).
+3. Fetch training data (from project root):
+   ```bash
+   python Data/fetchTopRankedPlayers.py  # Fetches top players
+   ```
+4. Navigate to the ML project directory:
    ```bash
    cd Predict
    ```
-3. Fetch training data:
+5. Fetch match/timeline data:
    ```bash
-   python topNPlayers.py  # Fetches top players
    python fetchdata.py    # Fetches match data for training
    ```
-4. Run timeline analysis:
+6. Run timeline analysis:
    ```bash
    python AllInfo.py
    ```
-5. Train prediction models:
+7. Train prediction models:
    ```bash
    python TDpredict.py  # Trains models for enemy jungler location prediction
    ```
@@ -201,7 +206,7 @@ With an OpenAI-compatible API (OpenAI or local e.g. Ollama):
 ## 📝 Notes
 
 - **Replay** is stateless - no database required. Every search fetches fresh data from Riot API.
-- **Predict** stores data locally for training purposes. Data is fetched using `topNPlayers.py` and `fetchdata.py`.
+- **Predict** stores data locally for training purposes. Data is fetched using `Data/fetchTopRankedPlayers.py` and `fetchdata.py`.
 - **Live** requires trained models from Predict module. Ensure models are trained and saved in `Predict/models/` before running Live.
 - **Live** does not use Riot API - it visually monitors the minimap using screen capture/computer vision.
 - When the jungler appears on the minimap, Live captures their coordinates, which counts as position info for training.
