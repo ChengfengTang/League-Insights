@@ -37,6 +37,9 @@ venv/
 ENV/
 .venv/
 
+# OS
+.DS_Store
+
 # IDE
 .idea/
 .vscode/
