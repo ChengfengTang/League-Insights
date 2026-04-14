@@ -1,0 +1,88 @@
+League Insights — Trajectory prediction (research note)
+=======================================================
+
+Introduction
+------------
+We study short-horizon prediction of player position in League of Legends from
+match timelines. Full-map coordinates are noisy and hard to regress directly;
+we therefore formulate the task as discrete sequence classification: given recent
+game state, estimate a probability mass over map quadrants (or grid cells) for
+where the player will be at the next timestep (or over a small lookahead). A
+single “best” cell is optional—typically argmax or top-k from that distribution—
+because in reality several regions are often plausible. Data are assumed to come from match
+or replay-derived events aggregated to a fixed cadence (e.g., per minute) with
+interpolation where samples are missing, so each training example is a row or
+sequence ending at time t and a label for position at t + h.
+
+What we are measuring
+---------------------
+Primary: how well the full predictive distribution matches held-out labels—
+cross-entropy / log loss (and related proper scoring rules), which reward
+assigning mass to the true cell and to plausible neighbors if we add spatial
+smoothing or distance-weighted targets. Secondary: argmax accuracy, per-class
+recall, and macro-F1 (these only reflect the peak, not spread mass). We also
+check calibration of probabilities (reliability curves or post-hoc calibration
+if decisions depend on numeric confidence), distance-aware summaries (e.g.
+expected error under a map metric), and comparison against naive baselines
+(persistence, Markov / n-gram on quadrant sequences). Confusion matrices on
+argmax still help show whether errors cluster on spatial neighbors.
+
+What we intend to do
+--------------------
+Learn a model that maps recent trajectory and scalar game features to a
+normalized distribution over discrete locations (softmax over cells). Treat that
+vector as the main output for analysis and downstream use (e.g. top-k regions,
+entropy as uncertainty); derive a point prediction only when the product needs
+one. Start with the simplest targets and baselines and scale complexity only if
+needed. Champion identity and coarse playstyle categories (see champCategory.py
+for jungler-oriented groupings) may enter as categoricals or embeddings; role,
+team side, and game phase are candidates for additional conditioning.
+
+How we will achieve it (implementation plan)
+--------------------------------------------
+1. Data construction  
+   Build supervised samples: features at time t (and optionally a short lag
+   window) from time, position history, CS, level, champion ids, and
+   role-aligned opponents; label = quadrant at t + h. Avoid leakage: no
+   future CS, kills, or events not observable at t. Optionally normalize map
+   coordinates to one team perspective or augment with mirror flips to reduce
+   blue/red artifacts. Collection policy: fetch up to 100 matches per player
+   (or fewer if unavailable), restrict to Ranked Solo/Duo on Summoner's Rift
+   (queueId 420, mapId 11), and deduplicate by matchId across players so one
+   unique match contributes all 10 participant timelines without duplicate files.
+
+2. Baselines  
+   Persistence (same quadrant as last step) and low-order Markov models on
+   quadrant sequences to establish a floor and to judge whether learned models
+   add value.
+
+3. Tabular models  
+   Gradient-boosted trees (e.g., LightGBM / XGBoost) on engineered lag
+   features: recent quadrants, deltas in CS and level, clock or phase. Strong
+   default when the horizon is short and history is featurized explicitly.
+
+4. Sequence models (optional)  
+   If longer context matters (objective setup, recalls), stack embeddings for
+   champions and feed the last T timesteps through a small GRU/LSTM or
+   Transformer encoder, then a softmax over quadrants.
+
+5. Training objective and outputs  
+   Train with cross-entropy against the true cell (standard multiclass). If we
+   want the model to hedge across neighboring cells, optional label smoothing or
+   a target distribution that spreads mass to adjacent quadrants can reflect
+   spatial ambiguity. Expose predict_proba (or logits → softmax) as the primary
+   API; report argmax accuracy as a secondary, user-facing summary.
+
+6. Inputs vs labels  
+   Labels discretized to quadrants; inputs may combine raw or fine-grid coordinates with quadrant history so the model retains sub-cell motion where
+   useful. Sensitivity to interpolation method should be checked so the model
+   does not fit synthetic motion.
+
+7. Evaluation discipline  
+   Hold out by match or player where possible; note patch and rank-tier shift
+   if training and test distributions differ. Compare against baselines before
+   claiming gains from architecture alone.
+
+This note guides experiments in the Predict/ pipeline; implementation details
+(code paths, exact grid, horizon h) live alongside the dataset builders and
+training scripts as they are added.

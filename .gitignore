@@ -1,14 +1,14 @@
 # Data directories
 Data/matches/
 Data/timelines/
-Data/players/
 Data/riotApiKey.txt
+Data/log/
 
 # Live 
 Live/
 
 # Predict
-Predict/
+
 
 # Python
 __pycache__/

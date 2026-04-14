@@ -55,6 +55,9 @@
     padding: 10px;
     background: #1a1a1a;
     border: 2px solid #333;
+    display: flex;
+    align-items: center;
+    gap: 12px;
   }
 
   .header {
@@ -86,6 +89,37 @@
     display: block;
     background: #000;
   }
+
+  #stats {
+    width: 340px;
+    max-height: calc(100vh - 20px);
+    margin: 10px 10px 10px auto;
+    padding: 10px;
+    overflow-y: auto;
+    font-family: monospace;
+    background: #1a1a1a;
+    border-left: 2px solid #333;
+  }
+
+  .stats-team-title {
+    font-weight: bold;
+    margin-top: 10px;
+    margin-bottom: 4px;
+  }
+
+  .stats-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto auto auto;
+    gap: 8px;
+    padding: 2px 0;
+    border-bottom: 1px solid #2a2a2a;
+    font-size: 12px;
+  }
+
+  .stats-header {
+    color: #aaa;
+    font-size: 11px;
+  }
 </style>
 </head>
 <body>
@@ -94,9 +128,11 @@
     <button class="back-button" onclick="window.location.href='/matches.html'">← Back to Matches</button>
   </div>
   <div id="controls">
+    <button id="playPauseBtn" onclick="togglePlayPause()">Pause</button>
     <input type="range" id="timeSlider" min="0" max="1000" value="0">
     <label for="timeSlider">Game Time: <span id="sliderTime">0:00</span></label>
   </div>
+  <div id="stats"><b>Player Stats</b><br />Loading...</div>
 
 <script>
 let champIconMap = {};
@@ -116,7 +152,8 @@ const gameTimePerTick = 0.1; // 100ms increments
 const matchId = new URLSearchParams(window.location.search).get("matchId");
 const displayedEvents = new Set();
 let isPlaying = true;
-let deathStates = {}; // Tracks { dead: boolean, deathTime: number, respawnTime: number }
+let deathWindowsByPid = {}; // participantId -> [{ deathTime, respawnTime, team }]
+let participantsById = {};
 
 function msToMinSec(ms) {
   const m = Math.floor(ms / 60000);
@@ -160,59 +197,109 @@ function calculateRespawnTime(level, gameMinutes) {
   return Math.round(base_timer * (1 + tif));
 }
 
-function interpolatePosition(point1, point2, t, events, participantId) {
-  if (!point2) return { x: point1.x, y: point1.y };
-  
-  // Find any events between point1 and point2 that involve this participant
-  const relevantEvents = events.filter(e => 
-    e.timeSeconds > point1.timeSeconds && 
-    e.timeSeconds <= point2.timeSeconds &&
-    (e.type === "CHAMPION_KILL" || e.type === "ELITE_MONSTER_KILL") &&
-    (
-      (e.type === "CHAMPION_KILL" && 
-        (e.killerId === participantId || 
-         e.victimId === participantId || 
-         (e.assistingParticipantIds || []).includes(participantId))) ||
-      (e.type === "ELITE_MONSTER_KILL" && e.killerId === participantId)
-    )
-  );
-
-  if (relevantEvents.length === 0) {
-    // Normal interpolation if no relevant events
-    const ratio = (t - point1.timeSeconds) / (point2.timeSeconds - point1.timeSeconds);
-    const x = point1.x + (point2.x - point1.x) * ratio;
-    const y = point1.y + (point2.y - point1.y) * ratio;
-    return { x, y };
-  }
-
-  // Find the last event before or at current time
-  const lastEvent = relevantEvents
-    .filter(e => e.timeSeconds <= t)
-    .sort((a, b) => b.timeSeconds - a.timeSeconds)[0];
-
-  if (!lastEvent) {
-    // If no events before current time, interpolate to first event
-    const ratio = (t - point1.timeSeconds) / (relevantEvents[0].timeSeconds - point1.timeSeconds);
-    const x = point1.x + (relevantEvents[0].position.x - point1.x) * ratio;
-    const y = point1.y + (relevantEvents[0].position.y - point1.y) * ratio;
-    return { x, y };
-  }
-
-  // If we're at an event, use its position
-  if (Math.abs(t - lastEvent.timeSeconds) < 0.1) {
-    return { x: lastEvent.position.x, y: lastEvent.position.y };
-  }
-
-  // If we're after the last event, interpolate to next point
-  const nextPoint = relevantEvents.find(e => e.timeSeconds > t) || point2;
-  const ratio = (t - lastEvent.timeSeconds) / (nextPoint.timeSeconds - lastEvent.timeSeconds);
-  const x = lastEvent.position.x + (nextPoint.x - lastEvent.position.x) * ratio;
-  const y = lastEvent.position.y + (nextPoint.y - lastEvent.position.y) * ratio;
-  return { x, y };
+function togglePlayPause() {
+  isPlaying = !isPlaying;
+  document.getElementById('playPauseBtn').textContent = isPlaying ? 'Pause' : 'Play';
 }
 
 function getBasePosition(team) {
   return team === "Blue" ? { x: 554, y: 581 } : { x: 14500, y: 14511 };
+}
+
+function getLatestPointAtOrBefore(points, t) {
+  let latest = null;
+  for (const point of points) {
+    if (point.timeSeconds <= t) latest = point;
+    else break;
+  }
+  return latest;
+}
+
+function getFirstPointAfter(points, t) {
+  for (const point of points) {
+    if (point.timeSeconds > t) return point;
+  }
+  return null;
+}
+
+function getActiveDeathWindow(participantId, t) {
+  const windows = deathWindowsByPid[participantId] || [];
+  for (const window of windows) {
+    if (t >= window.deathTime && t < window.respawnTime) return window;
+  }
+  return null;
+}
+
+function getMostRecentRespawnWindow(participantId, t) {
+  const windows = deathWindowsByPid[participantId] || [];
+  let best = null;
+  for (const window of windows) {
+    if (window.respawnTime <= t) best = window;
+    else break;
+  }
+  return best;
+}
+
+function buildLiveKdaByParticipant(t) {
+  const kda = {};
+  for (const participantId of Object.keys(participantsById)) {
+    kda[participantId] = { k: 0, d: 0, a: 0 };
+  }
+  for (const e of events) {
+    if (e.type !== "CHAMPION_KILL" || e.timeSeconds > t) continue;
+    if (kda[e.killerId]) kda[e.killerId].k += 1;
+    if (kda[e.victimId]) kda[e.victimId].d += 1;
+    for (const assisterId of (e.assistingParticipantIds || [])) {
+      if (kda[assisterId]) kda[assisterId].a += 1;
+    }
+  }
+  return kda;
+}
+
+function renderStatsPanel(grouped) {
+  const statsDiv = document.getElementById("stats");
+  const liveKda = buildLiveKdaByParticipant(currentGameTime);
+  const blueRows = [];
+  const redRows = [];
+
+  for (const [pidStr, champ] of Object.entries(champMap)) {
+    const points = grouped[pidStr] || [];
+    const latest = getLatestPointAtOrBefore(points, currentGameTime);
+    const kda = liveKda[pidStr] || { k: 0, d: 0, a: 0 };
+    const row = {
+      name: champ.name,
+      level: latest ? latest.level : 1,
+      cs: latest ? latest.cs : 0,
+      gold: latest ? latest.gold : 0,
+      kda: `${kda.k}/${kda.d}/${kda.a}`,
+    };
+    if (champ.team === "Blue") blueRows.push(row);
+    else redRows.push(row);
+  }
+
+  const renderRows = (rows) => rows
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((r) => `
+      <div class="stats-row">
+        <span>${r.name}</span>
+        <span>Lv ${r.level}</span>
+        <span>CS ${r.cs}</span>
+        <span>${r.gold}g</span>
+        <span>${r.kda}</span>
+      </div>
+    `)
+    .join("");
+
+  statsDiv.innerHTML = `
+    <b>Player Stats</b><br />
+    <div class="stats-row stats-header">
+      <span>Champion</span><span>Level</span><span>CS</span><span>Gold</span><span>K/D/A</span>
+    </div>
+    <div class="stats-team-title">Blue Team</div>
+    ${renderRows(blueRows)}
+    <div class="stats-team-title">Red Team</div>
+    ${renderRows(redRows)}
+  `;
 }
 
 function preload() {
@@ -225,13 +312,17 @@ async function fetchData() {
     const matchId = params.get("matchId");
     const apiKey = sessionStorage.getItem('riot_api_key');
 
-    if (!matchId || !apiKey) {
-      console.error("Missing matchId or API key. Please start over from the lookup page.");
-      document.getElementById('log').innerHTML = '<b>❌ Error</b><br />Missing matchId or API key. Please start over from the lookup page.';
+    if (!matchId) {
+      console.error("Missing matchId. Please start over from the lookup page.");
+      document.getElementById('log').innerHTML = '<b>❌ Error</b><br />Missing matchId. Please start over from the lookup page.';
       return;
     }
 
-    const res = await fetch(`/api/match/${matchId}?api_key=${encodeURIComponent(apiKey)}`);
+    const requestParams = new URLSearchParams();
+    if (apiKey) {
+      requestParams.set("api_key", apiKey);
+    }
+    const res = await fetch(`/api/match/${matchId}?${requestParams.toString()}`);
     if (!res.ok) {
       throw new Error(`Failed to fetch match data: ${res.status}`);
     }
@@ -248,8 +339,9 @@ async function fetchData() {
         name,
         team: p.teamId === 100 ? "Blue" : "Red"
       };
+      participantsById[p.participantId] = p;
       championNames.add(name);
-      deathStates[p.participantId] = { dead: false, deathTime: 0, respawnTime: 0 };
+      deathWindowsByPid[p.participantId] = [];
     }
 
     for (let name of championNames) {
@@ -326,11 +418,11 @@ async function fetchData() {
             event: `🔄 ${label(victim)} respawned at base`
           });
 
-          deathStates[event.victimId] = {
-            dead: true,
+          deathWindowsByPid[event.victimId].push({
             deathTime: eventTimeSec,
-            respawnTime: respawnTimeSec
-          };
+            respawnTime: respawnTimeSec,
+            team: champMap[event.victimId].team
+          });
 
           // Add assist events
           for (const a of (event.assistingParticipantIds || [])) {
@@ -388,16 +480,11 @@ async function setup() {
   const slider = document.getElementById('timeSlider');
   slider.addEventListener('input', () => {
     isPlaying = false;
+    document.getElementById('playPauseBtn').textContent = 'Play';
     currentGameTime = parseFloat(slider.value);
     document.getElementById('sliderTime').textContent = secondsToMinSec(currentGameTime);
     displayedEvents.clear();
     document.getElementById('log').innerHTML = '<b>📜 Event Log</b><br />';
-    for (const [pid, state] of Object.entries(deathStates)) {
-      state.dead = false; // Reset death states on slider scrub
-    }
-  });
-  slider.addEventListener('change', () => {
-    isPlaying = true;
   });
 }
 
@@ -422,9 +509,6 @@ function draw() {
         currentGameTime = 0;
         displayedEvents.clear();
         document.getElementById('log').innerHTML = '<b>📜 Event Log</b><br />';
-        for (const [pid, state] of Object.entries(deathStates)) {
-          state.dead = false;
-        }
       }
       document.getElementById('timeSlider').value = currentGameTime;
       document.getElementById('sliderTime').textContent = secondsToMinSec(currentGameTime);
@@ -438,29 +522,34 @@ function draw() {
   }
 
   for (const [pid, points] of Object.entries(grouped)) {
-    const state = deathStates[pid];
-    let pos;
-    let shouldDraw = true; // Flag to control whether to draw the champion
-    
-    if (state.dead && currentGameTime >= state.deathTime && currentGameTime < state.respawnTime) {
-      // If dead, don't draw the champion until respawn
-      shouldDraw = false;
-    } else {
-      // Normal movement interpolation with events
-      let curr = null;
-      let next = null;
-      for (let i = 0; i < points.length; i++) {
-        if (points[i].timeSeconds > currentGameTime) {
-          next = points[i];
-          curr = i > 0 ? points[i - 1] : points[i];
-          break;
-        }
-        curr = points[i];
-      }
-      pos = curr ? interpolatePosition(curr, next, currentGameTime, events, parseInt(pid)) : { x: curr.x, y: curr.y };
-    }
+    const participantId = parseInt(pid);
+    const activeDeath = getActiveDeathWindow(participantId, currentGameTime);
+    let pos = null;
+    let shouldDraw = !activeDeath;
 
     if (shouldDraw) {
+      const latest = getLatestPointAtOrBefore(points, currentGameTime);
+      const lastRespawn = getMostRecentRespawnWindow(participantId, currentGameTime);
+      if (latest) {
+        // No interpolation: icon snaps to latest recorded frame position.
+        pos = { x: latest.x, y: latest.y };
+      } else if (lastRespawn) {
+        // If no frame has appeared yet after respawn, keep icon at base.
+        pos = getBasePosition(lastRespawn.team);
+      } else {
+        const firstPoint = points[0];
+        pos = firstPoint ? { x: firstPoint.x, y: firstPoint.y } : null;
+      }
+
+      if (lastRespawn) {
+        const nextAfterRespawn = getFirstPointAfter(points, lastRespawn.respawnTime);
+        if (!nextAfterRespawn || currentGameTime < nextAfterRespawn.timeSeconds) {
+          pos = getBasePosition(lastRespawn.team);
+        }
+      }
+    }
+
+    if (shouldDraw && pos) {
       const x = (pos.x / 15000) * mapSize * scaleFactor;
       const y = ((15000 - pos.y) / 15000) * mapSize * scaleFactor;
       imageMode(CENTER);
@@ -476,6 +565,8 @@ function draw() {
       imageMode(CORNER);
     }
   }
+
+  renderStatsPanel(grouped);
 
   for (const e of events) {
     const eventTime = e.timeSeconds;

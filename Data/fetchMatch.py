@@ -1,51 +1,142 @@
 """
-Fetch match metadata + timeline files for players from a selected Data/players JSONL file.
+Fetch match metadata and timelines for players listed in a fetchPlayer run folder.
 
-How to run:
-- Put Riot API key in Data/riotApiKey.txt
-- Ensure a players snapshot exists in Data/players/ (from fetchPlayer.py)
-- Run: python Data/fetchMatch.py --playersFile top300-ranked-solo-5x5-na1-20260413-175452.jsonl --count 100
+Put one or more API keys in Data/riotApiKey.txt (one per line; # starts a comment).
+
+Example:
+  python Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-235836
+  python Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-235836 --count 50
+
+Expects that folder to contain one or more *.jsonl files (e.g. challenger-grandmaster.jsonl,
+master.jsonl, diamondI.jsonl …). Each file is one job. With multiple keys, one worker process
+per key runs jobs from a queue (same scheduling idea as fetchPlayer).
+
+Writes:
+  Data/matches/<run-folder-name>/<division-stem>/<matchId>.json
+  Data/timelines/<run-folder-name>/<division-stem>/<matchId>_timeline.json
+
+CLI: --playersFolder (required; run folder name starts with the platform shard, e.g. na1-...).
+      --count optional; max match IDs to request per player (default 100).
+
+Match-v5 host (americas / europe / asia) is inferred from that leading token, same grouping as
+fetchPlayer uses for account routing. Optional sleeps between requests were removed; 429 backoff
+in riotGet remains if Riot throttles.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
 import time
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import quote
 
 import requests
-
 
 dataDir = Path(__file__).resolve().parent
 apiKeyPath = dataDir / "riotApiKey.txt"
 playersDir = dataDir / "players"
 matchesDir = dataDir / "matches"
 timelinesDir = dataDir / "timelines"
+TARGET_QUEUE_ID = 420  # Ranked Solo/Duo
+TARGET_MAP_ID = 11     # Summoner's Rift
+
+workerShutdown = None
 
 
-def readRiotApiKey() -> str:
-    """Read Riot API key from local file."""
+def readRiotAPIKeys() -> List[str]:
     if not apiKeyPath.exists():
         raise RuntimeError(f"Missing API key file: {apiKeyPath}")
-    apiKey = apiKeyPath.read_text(encoding="utf-8").strip()
-    if not apiKey:
-        raise RuntimeError(f"API key file is empty: {apiKeyPath}")
-    return apiKey
-
-
-riotApiKey = readRiotApiKey()
+    keys: List[str] = []
+    for line in apiKeyPath.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        keys.append(line)
+    if not keys:
+        raise RuntimeError(f"No API keys found in {apiKeyPath}")
+    return keys
 
 
 def getRiotHeaders() -> Dict[str, str]:
-    """Build Riot auth headers."""
-    return {"X-Riot-Token": riotApiKey}
+    key = os.environ.get("RIOT_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("RIOT_API_KEY is not set in the environment for this process")
+    return {"X-Riot-Token": key}
+
+
+def parseRetryAfterSeconds(response: requests.Response) -> Optional[float]:
+    retry = response.headers.get("Retry-After")
+    if retry is None:
+        return None
+    try:
+        return float(retry)
+    except ValueError:
+        return None
+
+
+def riotGet(url: str, headers: Dict[str, str], maxRetries: int = 12) -> requests.Response:
+    attempt = 0
+    while True:
+        response = requests.get(url, headers=headers, timeout=60)
+        if response.status_code == 429 and attempt < maxRetries:
+            attempt += 1
+            delay = parseRetryAfterSeconds(response)
+            if delay is None:
+                delay = min(2.0 ** min(attempt, 7), 120.0)
+            time.sleep(delay)
+            continue
+        return response
+
+
+def resolvePlayersFolder(arg: str) -> Path:
+    """Resolve user path: absolute, or relative to Data, or basename under Data/players."""
+    raw = Path(arg)
+    if raw.is_absolute():
+        resolved = raw.resolve()
+        if resolved.is_dir():
+            return resolved
+        raise RuntimeError(f"Players folder not found: {arg}")
+
+    candidate = (dataDir / raw).resolve()
+    if candidate.is_dir():
+        return candidate
+    underPlayers = (playersDir / raw).resolve()
+    if underPlayers.is_dir():
+        return underPlayers
+    raise RuntimeError(
+        f"Players folder not found: {arg} (tried {candidate} and {underPlayers})"
+    )
+
+
+def platformRegionFromRunName(runName: str) -> str:
+    """First hyphen-separated segment of fetchPlayer output dir, e.g. na1 from na1-ranked-solo-5x5-...."""
+    if not runName or "-" not in runName:
+        raise RuntimeError(
+            f"Run folder name must start with platform-region then '-', got: {runName!r}"
+        )
+    token = runName.split("-", 1)[0].strip().lower()
+    if not token:
+        raise RuntimeError(f"Missing platform region in run folder name: {runName!r}")
+    return token
+
+
+def matchClusterForPlatform(platformRegion: str) -> str:
+    """Match-v5 routing value (subdomain) for a platform shard: americas, europe, or asia."""
+    r = platformRegion.lower().strip()
+    if r in ("na1", "br1", "la1", "la2"):
+        return "americas"
+    if r in ("euw1", "eun1", "tr1", "ru", "me1"):
+        return "europe"
+    if r in ("kr", "jp1", "oc1", "ph2", "sg2", "th2", "tw2", "vn2"):
+        return "asia"
+    return "americas"
 
 
 def loadPlayersFromJsonl(playersPath: Path) -> List[Dict]:
-    """
-    Load player rows from Data/topRankedPlayers.jsonl.
-    Expected fields include at least: username, tag, puuid.
-    """
     if not playersPath.exists():
         raise RuntimeError(f"Missing players file: {playersPath}")
 
@@ -58,37 +149,101 @@ def loadPlayersFromJsonl(playersPath: Path) -> List[Dict]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if row.get("puuid"):
+        if row.get("username") and row.get("tag"):
             players.append(row)
     return players
 
 
-def fetchMatchIds(matchRegion: str, puuid: str, count: int) -> List[str]:
-    """Fetch recent match IDs for one player."""
+def fetchPuuidFromRiotId(matchCluster: str, username: str, tag: str) -> str:
+    encodedName = quote(username, safe="")
+    encodedTag = quote(tag, safe="")
     url = (
-        f"https://{matchRegion}.api.riotgames.com/lol/match/v5/matches/"
-        f"by-puuid/{puuid}/ids?count={count}"
+        f"https://{matchCluster}.api.riotgames.com/riot/account/v1/accounts/"
+        f"by-riot-id/{encodedName}/{encodedTag}"
     )
-    response = requests.get(url, headers=getRiotHeaders())
+    response = riotGet(url, headers=getRiotHeaders())
+    if response.status_code != 200:
+        raise Exception(
+            f"Failed to get puuid for {username}#{tag}: "
+            f"{response.status_code} - {response.text}"
+        )
+    payload = response.json()
+    puuid = payload.get("puuid")
+    if not puuid:
+        raise Exception(f"Missing puuid in Riot ID lookup for {username}#{tag}")
+    return puuid
+
+
+def fetchMatchIds(matchCluster: str, puuid: str, count: int) -> List[str]:
+    url = (
+        f"https://{matchCluster}.api.riotgames.com/lol/match/v5/matches/"
+        f"by-puuid/{puuid}/ids?count={count}&queue={TARGET_QUEUE_ID}"
+    )
+    response = riotGet(url, headers=getRiotHeaders())
     if response.status_code != 200:
         raise Exception(f"Failed to get match IDs: {response.status_code} - {response.text}")
     return response.json()
 
 
 def saveJson(path: Path, payload: Dict) -> None:
-    """Write JSON payload to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def fetchAndSaveMatchFiles(matchRegion: str, matchId: str) -> None:
-    """Download and save timeline + metadata JSON for one match."""
-    timelinePath = timelinesDir / f"{matchId}_timeline.json"
-    matchPath = matchesDir / f"{matchId}.json"
+def readJson(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def isEligibleMatchMetadata(matchData: Dict[str, Any]) -> bool:
+    info = matchData.get("info", {})
+    return info.get("queueId") == TARGET_QUEUE_ID and info.get("mapId") == TARGET_MAP_ID
+
+
+def fetchAndSaveMatchFiles(
+    matchCluster: str,
+    matchId: str,
+    matchesDivisionDir: Path,
+    timelinesDivisionDir: Path,
+) -> None:
+    timelinePath = timelinesDivisionDir / f"{matchId}_timeline.json"
+    matchPath = matchesDivisionDir / f"{matchId}.json"
+
+    matchData: Optional[Dict[str, Any]] = None
+    if matchPath.exists():
+        matchData = readJson(matchPath)
+        if matchData is None:
+            print(f"Invalid metadata JSON for {matchId}, refetching")
+    if matchData is None:
+        matchUrl = f"https://{matchCluster}.api.riotgames.com/lol/match/v5/matches/{matchId}"
+        response = riotGet(matchUrl, headers=getRiotHeaders())
+        if response.status_code == 200:
+            matchData = response.json()
+            saveJson(matchPath, matchData)
+            print(f"Saved metadata for {matchId}")
+        else:
+            print(f"Failed metadata for {matchId}: {response.status_code}")
+            return
+    else:
+        print(f"Metadata exists for {matchId}, skipping")
+
+    if not isEligibleMatchMetadata(matchData):
+        queueId = matchData.get("info", {}).get("queueId")
+        mapId = matchData.get("info", {}).get("mapId")
+        print(
+            f"Skipping {matchId}: expected queue {TARGET_QUEUE_ID} on map {TARGET_MAP_ID}, "
+            f"got queue {queueId}, map {mapId}"
+        )
+        return
 
     if not timelinePath.exists():
-        timelineUrl = f"https://{matchRegion}.api.riotgames.com/lol/match/v5/matches/{matchId}/timeline"
-        response = requests.get(timelineUrl, headers=getRiotHeaders())
+        timelineUrl = (
+            f"https://{matchCluster}.api.riotgames.com/lol/match/v5/matches/"
+            f"{matchId}/timeline"
+        )
+        response = riotGet(timelineUrl, headers=getRiotHeaders())
         if response.status_code == 200:
             saveJson(timelinePath, response.json())
             print(f"Saved timeline for {matchId}")
@@ -97,61 +252,202 @@ def fetchAndSaveMatchFiles(matchRegion: str, matchId: str) -> None:
     else:
         print(f"Timeline exists for {matchId}, skipping")
 
-    if not matchPath.exists():
-        matchUrl = f"https://{matchRegion}.api.riotgames.com/lol/match/v5/matches/{matchId}"
-        response = requests.get(matchUrl, headers=getRiotHeaders())
-        if response.status_code == 200:
-            saveJson(matchPath, response.json())
-            print(f"Saved metadata for {matchId}")
-        else:
-            print(f"Failed metadata for {matchId}: {response.status_code}")
-    else:
-        print(f"Metadata exists for {matchId}, skipping")
 
+def runJsonlJob(task: Dict) -> None:
+    """Process one division JSONL: list matches per player, save under run/division dirs."""
+    dataDirPath = Path(task["dataDirStr"])
+    runName = task["runName"]
+    divisionLabel = task["divisionLabel"]
+    jsonlPath = Path(task["jsonlPath"])
+    matchCluster = task["matchCluster"]
+    matchCount = int(task["matchCount"])
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch match/timeline data for top-ranked players.")
-    parser.add_argument(
-        "--playersFile",
-        required=True,
-        help="File name under Data/players, e.g. top300-ranked-solo-5x5-na1-20260413-175452.jsonl",
-    )
-    parser.add_argument("--count", type=int, default=100, help="Matches per player to request")
-    parser.add_argument("--matchRegion", default="americas", help="Match-v5 region, e.g. americas/europe/asia")
-    parser.add_argument("--sleepSec", type=float, default=1.0, help="Delay between API requests")
-    args = parser.parse_args()
+    matchesDivisionDir = dataDirPath / "matches" / runName / divisionLabel
+    timelinesDivisionDir = dataDirPath / "timelines" / runName / divisionLabel
+    matchesDivisionDir.mkdir(parents=True, exist_ok=True)
+    timelinesDivisionDir.mkdir(parents=True, exist_ok=True)
 
-    playersPath = playersDir / Path(args.playersFile).name
-    matchesDir.mkdir(parents=True, exist_ok=True)
-    timelinesDir.mkdir(parents=True, exist_ok=True)
+    players = loadPlayersFromJsonl(jsonlPath)
+    print(f"[{divisionLabel}] Loaded {len(players)} players from {jsonlPath.name}")
 
-    players = loadPlayersFromJsonl(playersPath)
-    print(f"Loaded {len(players)} players from {playersPath}")
-
+    seenRiotIds: Set[str] = set()
     seenMatchIds: Set[str] = set()
     for player in players:
         username = player.get("username", "unknown")
         tag = player.get("tag", "unknown")
-        puuid = player.get("puuid")
-        if not puuid:
-            print(f"Skipping {username}#{tag}: missing puuid")
+        riotIdKey = f"{str(username).strip().lower()}#{str(tag).strip().lower()}"
+        if not username or not tag:
+            print(f"[{divisionLabel}] Skipping entry with missing username/tag")
+            continue
+        if riotIdKey in seenRiotIds:
+            continue
+        seenRiotIds.add(riotIdKey)
+
+        try:
+            puuid = fetchPuuidFromRiotId(matchCluster, username, tag)
+        except Exception as error:
+            print(f"[{divisionLabel}] Failed Riot ID lookup for {username}#{tag}: {error}")
             continue
 
         try:
-            matchIds = fetchMatchIds(args.matchRegion, puuid, args.count)
-            print(f"Found {len(matchIds)} matches for {username}#{tag}")
+            matchIds = fetchMatchIds(matchCluster, puuid, matchCount)
+            print(f"[{divisionLabel}] {len(matchIds)} match IDs for {username}#{tag}")
         except Exception as error:
-            print(f"Failed match list for {username}#{tag}: {error}")
+            print(f"[{divisionLabel}] Failed match list for {username}#{tag}: {error}")
             continue
-
-        time.sleep(args.sleepSec)
 
         for matchId in matchIds:
             if matchId in seenMatchIds:
                 continue
             seenMatchIds.add(matchId)
-            fetchAndSaveMatchFiles(args.matchRegion, matchId)
-            time.sleep(args.sleepSec)
+            fetchAndSaveMatchFiles(
+                matchCluster, matchId, matchesDivisionDir, timelinesDivisionDir
+            )
+
+
+def matchFileWorkerLoop(
+    apiKey: str,
+    taskQueue: "multiprocessing.Queue",
+    doneQueue: "multiprocessing.Queue",
+) -> None:
+    while True:
+        item = taskQueue.get()
+        if item is workerShutdown:
+            break
+        task = item
+        try:
+            os.environ["RIOT_API_KEY"] = apiKey.strip()
+            runJsonlJob(task)
+            doneQueue.put(task["divisionLabel"])
+        except Exception as exc:
+            label = task.get("divisionLabel", "?") if isinstance(task, dict) else "?"
+            print(f"[worker] failed job {label}: {exc}")
+            doneQueue.put(("__error__", str(exc)))
+
+
+def buildTasksForFolder(
+    playersFolder: Path,
+    matchCluster: str,
+    matchCount: int,
+) -> List[Dict]:
+    runName = playersFolder.name
+    jsonlFiles = sorted(playersFolder.glob("*.jsonl"))
+    if not jsonlFiles:
+        raise RuntimeError(f"No *.jsonl files in {playersFolder}")
+
+    dataDirStr = str(dataDir.resolve())
+    tasks: List[Dict] = []
+    for path in jsonlFiles:
+        tasks.append(
+            {
+                "jsonlPath": str(path.resolve()),
+                "divisionLabel": path.stem,
+                "matchCluster": matchCluster,
+                "matchCount": matchCount,
+                "dataDirStr": dataDirStr,
+                "runName": runName,
+            }
+        )
+    return tasks
+
+
+def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
+    numJobs = len(tasks)
+    numWorkers = len(apiKeys)
+
+    if numWorkers == 1:
+        os.environ["RIOT_API_KEY"] = apiKeys[0].strip()
+        for task in tasks:
+            runJsonlJob(task)
+        return
+
+    manager = multiprocessing.Manager()
+    taskQueue = manager.Queue()
+    doneQueue = manager.Queue()
+
+    workers: List[multiprocessing.Process] = []
+    for key in apiKeys:
+        proc = multiprocessing.Process(
+            target=matchFileWorkerLoop,
+            args=(key, taskQueue, doneQueue),
+        )
+        proc.start()
+        workers.append(proc)
+
+    inFlight: Set[str] = set()
+    nextJobIndex = 0
+
+    def tryDispatch() -> None:
+        nonlocal nextJobIndex
+        while len(inFlight) < numWorkers and nextJobIndex < numJobs:
+            task = tasks[nextJobIndex]
+            nextJobIndex += 1
+            taskQueue.put(task)
+            inFlight.add(task["divisionLabel"])
+            print(
+                f"[scheduler] dispatched {task['divisionLabel']} "
+                f"(running: {sorted(inFlight)})"
+            )
+
+    tryDispatch()
+
+    while inFlight or nextJobIndex < numJobs:
+        if not inFlight:
+            if nextJobIndex >= numJobs:
+                break
+            tryDispatch()
+            if not inFlight:
+                continue
+
+        finished = doneQueue.get()
+        if isinstance(finished, tuple) and finished[0] == "__error__":
+            for _ in workers:
+                taskQueue.put(workerShutdown)
+            raise RuntimeError(finished[1])
+        inFlight.discard(finished)
+        print(f"[scheduler] finished {finished} (running: {sorted(inFlight)})")
+        tryDispatch()
+
+    for _ in workers:
+        taskQueue.put(workerShutdown)
+    for proc in workers:
+        proc.join(timeout=600)
+        if proc.is_alive():
+            proc.terminate()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Fetch matches/timelines for each JSONL in a fetchPlayer run folder."
+    )
+    parser.add_argument(
+        "--playersFolder",
+        required=True,
+        help="Run folder under Data/players, e.g. players/na1-ranked-solo-5x5-20260413-235836",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=100,
+        help="Max match IDs to request per player",
+    )
+    args = parser.parse_args()
+
+    apiKeys = readRiotAPIKeys()
+    print(f"Loaded {len(apiKeys)} API key(s) from {apiKeyPath}")
+
+    playersFolder = resolvePlayersFolder(args.playersFolder)
+    runName = playersFolder.name
+    platformRegion = platformRegionFromRunName(runName)
+    matchCluster = matchClusterForPlatform(platformRegion)
+    tasks = buildTasksForFolder(playersFolder, matchCluster, args.count)
+    print(f"Players folder: {playersFolder}")
+    print(f"Platform {platformRegion!r} -> match cluster {matchCluster!r}")
+    print(f"Jobs ({len(tasks)}): " + " → ".join(t["divisionLabel"] for t in tasks))
+    print(f"Output: {matchesDir / runName}/<division>/ and {timelinesDir / runName}/<division>/")
+
+    runDynamicMatchPool(apiKeys, tasks)
+    print("\nDone.")
 
 
 if __name__ == "__main__":

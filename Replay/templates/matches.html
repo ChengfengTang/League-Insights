@@ -94,9 +94,11 @@
 
   <script>
     let patchVersion = "15.11.1"; // Fallback value as of 6/1/2025, needs update 
-    let currentStart = 0;
+    let currentStart = 0; // Offset of next match-id page to request.
     let isLoading = false;
+    let isSearchingValidMatches = false;
     let hasMoreMatches = true;
+    const MATCH_BATCH_SIZE = 5;
 
     // Cache for match data
     const matchCache = new Map();
@@ -175,7 +177,11 @@
         return matchCache.get(matchId);
       }
 
-      const res = await fetch(`/api/match/${matchId}?api_key=${encodeURIComponent(apiKey)}`);
+      const params = new URLSearchParams();
+      if (apiKey) {
+        params.set("api_key", apiKey);
+      }
+      const res = await fetch(`/api/match/${matchId}?${params.toString()}`);
       if (!res.ok) throw new Error(`Failed to fetch match data: ${res.status}`);
       const data = await res.json();
       
@@ -197,29 +203,16 @@
         const puuid = params.get("puuid") || sessionStorage.getItem('current_puuid');
         const apiKey = sessionStorage.getItem('riot_api_key');
 
-        if (!puuid || !apiKey) {
-          throw new Error("Missing PUUID or API key");
+        if (!puuid) {
+          throw new Error("Missing PUUID");
         }
-
-        const res = await fetch(`/api/matches/${puuid}/more?start=${currentStart + 20}&count=20&api_key=${encodeURIComponent(apiKey)}`);
-        if (!res.ok) throw new Error(`Failed to fetch more matches: ${res.status}`);
-        
-        const matchIds = await res.json();
-        if (matchIds.length === 0) {
-          hasMoreMatches = false;
-          loadMoreBtn.style.display = 'none';
-          return;
-        }
-
-        currentStart += 20;
-        await displayMatches(matchIds, puuid, apiKey);
+        await loadValidMatches(puuid, apiKey, MATCH_BATCH_SIZE, false);
       } catch (err) {
         console.error('Failed to load more matches:', err);
         loadMoreBtn.textContent = 'Error loading more matches. Click to retry.';
       } finally {
-        loadMoreBtn.disabled = false;
-        loadMoreBtn.textContent = 'Load More Matches';
         isLoading = false;
+        updateLoadMoreButton();
       }
     }
 
@@ -235,15 +228,25 @@
       await fetchMatches();
     }
 
-    async function displayMatches(matchIds, puuid, apiKey) {
+    async function displayMatches(matchIds, puuid, apiKey, clearExisting = false) {
       const matchListDiv = document.getElementById("match-list");
-      if (currentStart === 0) {
+      if (clearExisting) {
         matchListDiv.innerHTML = "";
       }
+      let renderedCount = 0;
 
       for (const matchId of matchIds) {
         try {
           const { metadata, timeline } = await fetchMatchData(matchId, apiKey);
+          // Only render Summoner's Rift matches (mapId 11).
+          if (metadata?.info?.mapId !== 11) {
+            continue;
+          }
+          // Skip custom/unknown queue types.
+          const queueLabel = getGameMode(metadata?.info?.queueId);
+          if (queueLabel === "Custom Game") {
+            continue;
+          }
 
           const user = metadata.info.participants.find(p => p.puuid === puuid);
           if (!user) continue;
@@ -267,7 +270,7 @@
           const infoText = document.createElement("div");
           infoText.className = "text-details";
           infoText.innerHTML = `
-            <div class="game-mode">${getGameMode(metadata.info.queueId)}</div>
+            <div class="game-mode">${queueLabel}</div>
             <strong>${user.championName} (${user.kills}/${user.deaths}/${user.assists})</strong>
             Level ${user.champLevel}, CS ${user.totalMinionsKilled + user.neutralMinionsKilled}
             <br>${formatDate(metadata.info.gameStartTimestamp)} | Duration: ${formatDuration(metadata.info.gameDuration)}
@@ -329,14 +332,71 @@
           card.appendChild(teamsDiv);
           card.appendChild(actionsDiv);
           matchListDiv.appendChild(card);
+          renderedCount += 1;
         } catch (err) {
           console.error(`Failed to load match ${matchId}:`, err);
         }
       }
 
-      // Show/hide load more button
+      return renderedCount;
+    }
+
+    function updateLoadMoreButton() {
       const loadMoreBtn = document.getElementById('load-more');
-      loadMoreBtn.style.display = hasMoreMatches ? 'block' : 'none';
+      loadMoreBtn.style.display = 'block';
+
+      if (isLoading || isSearchingValidMatches) {
+        loadMoreBtn.disabled = true;
+        loadMoreBtn.textContent = 'Loading...';
+        return;
+      }
+
+      loadMoreBtn.disabled = !hasMoreMatches;
+      loadMoreBtn.textContent = hasMoreMatches ? 'Load More Matches' : 'No More Matches';
+    }
+
+    async function fetchMatchIdsPage(puuid, apiKey) {
+      const paramsForMore = new URLSearchParams({
+        start: String(currentStart),
+        count: String(MATCH_BATCH_SIZE)
+      });
+      if (apiKey) {
+        paramsForMore.set("api_key", apiKey);
+      }
+      const res = await fetch(`/api/matches/${puuid}/more?${paramsForMore.toString()}`);
+      if (!res.ok) throw new Error(`Failed to fetch more matches: ${res.status}`);
+      const matchIds = await res.json();
+      currentStart += matchIds.length;
+      return matchIds;
+    }
+
+    async function loadValidMatches(puuid, apiKey, targetRenderedCount, clearExisting) {
+      let totalRendered = 0;
+      let shouldClear = clearExisting;
+      isSearchingValidMatches = true;
+      updateLoadMoreButton();
+
+      try {
+        while (hasMoreMatches && totalRendered < targetRenderedCount) {
+          const matchIds = await fetchMatchIdsPage(puuid, apiKey);
+          if (matchIds.length === 0) {
+            hasMoreMatches = false;
+            break;
+          }
+
+          const rendered = await displayMatches(matchIds, puuid, apiKey, shouldClear);
+          totalRendered += rendered;
+          shouldClear = false;
+        }
+
+        if (clearExisting && totalRendered === 0) {
+          const matchListDiv = document.getElementById("match-list");
+          matchListDiv.textContent = "No Summoner's Rift matches found in the current results.";
+        }
+      } finally {
+        isSearchingValidMatches = false;
+        updateLoadMoreButton();
+      }
     }
 
     async function fetchMatches() 
@@ -348,9 +408,9 @@
       const apiKey = sessionStorage.getItem('riot_api_key');
       const matchListDiv = document.getElementById("match-list");
 
-      if (!puuid || !apiKey) 
+      if (!puuid) 
       {
-        matchListDiv.textContent = "Missing PUUID or API key. Please start over from the lookup page.";
+        matchListDiv.textContent = "Missing PUUID. Please start over from the lookup page.";
         return;
       }
 
@@ -361,18 +421,9 @@
 
       try 
       {
-        const res = await fetch(`/api/matches/${puuid}?api_key=${encodeURIComponent(apiKey)}`);
-        if (!res.ok) throw new Error(`Failed to fetch matches: ${res.status}`);
-        
-        const matchIds = await res.json();
-        if (matchIds.length === 0) {
-          matchListDiv.textContent = "No matches found.";
-          return;
-        }
-
         currentStart = 0;
-        hasMoreMatches = matchIds.length === 20;
-        await displayMatches(matchIds, puuid, apiKey);
+        hasMoreMatches = true;
+        await loadValidMatches(puuid, apiKey, MATCH_BATCH_SIZE, true);
       } 
       catch (err) 
       {
@@ -383,11 +434,6 @@
 
     function viewReplay(matchId) 
     {
-      const apiKey = sessionStorage.getItem('riot_api_key');
-      if (!apiKey) {
-        alert('API key not found. Please start over from the lookup page.');
-        return;
-      }
       window.location.href = `/replay.html?matchId=${matchId}`;
     }
 

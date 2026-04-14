@@ -1,6 +1,5 @@
 """
 League of Legends Replay Application
-====================================
 
 OP.GG-style web application for League of Legends match exploration.
 This application provides functionality to:
@@ -21,6 +20,8 @@ from flask import Flask, request, jsonify, send_file, render_template
 import requests
 import os
 import json
+from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file for secure configuration
@@ -29,14 +30,33 @@ load_dotenv()
 # Initialize Flask application
 app = Flask(__name__)
 
-# Running server on http://127.0.0.1:5000
-# Set your Riot API key here
-# Get API key from https://developer.riotgames.com/
-# One way is to make users enter their own api key so it could never be an issue for public website
-#API_KEY = 'RGAPI-b761cebd-10ec-4ea8-9eec-4cc2d45411e0'
-#HEADERS = {'X-Riot-Token': API_KEY}
-
 MATCH_REGION = "americas" # May need to add options for EUROPE and ASIA but doesn't seem to matter right now
+DEFAULT_MATCH_COUNT = 5
+DEFAULT_API_KEY_PATH = Path(__file__).resolve().parent.parent / "Data" / "riotApiKey.txt"
+
+def resolve_api_key(request_api_key: Optional[str]) -> Optional[str]:
+    """
+    Resolve Riot API key by priority:
+    1) query param api_key
+    2) RIOT_API_KEY env var
+    3) last non-empty line in Data/riotApiKey.txt
+    """
+    if request_api_key and request_api_key.strip():
+        return request_api_key.strip()
+
+    env_key = os.getenv("RIOT_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        if DEFAULT_API_KEY_PATH.exists():
+            lines = [line.strip() for line in DEFAULT_API_KEY_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if lines:
+                return lines[-1]
+    except OSError:
+        return None
+
+    return None
 
 @app.route("/api/lookup")
 def lookup():
@@ -53,11 +73,13 @@ def lookup():
     """
     name = request.args.get("name")
     tag = request.args.get("tag")
-    api_key = request.args.get("api_key")
+    api_key = resolve_api_key(request.args.get("api_key"))
     
     # Validate required parameters
-    if not name or not tag or not api_key:
-        return jsonify({"error": "Missing name, tag, or API key"}), 400
+    if not name or not tag:
+        return jsonify({"error": "Missing name or tag"}), 400
+    if not api_key:
+        return jsonify({"error": "Missing API key (query, RIOT_API_KEY, or Data/riotApiKey.txt)"}), 400
 
     # Set up API request headers
     headers = {'X-Riot-Token': api_key}
@@ -69,8 +91,6 @@ def lookup():
         return jsonify({"error": "Rate limit exceeded, try again later"}), 429
     elif r.status_code != 200:
         return jsonify({"error": f"Failed to fetch PUUID: {r.status_code}"}), r.status_code
-
-    # Return fresh data - no database storage
     return jsonify(r.json())
 
 @app.route("/api/matches/<puuid>")
@@ -84,18 +104,18 @@ def get_matches(puuid):
     Query Parameters:
         api_key (str): Riot Games API key
         start (int): Starting index for pagination (default: 0)
-        count (int): Number of matches to retrieve (default: 20)
+        count (int): Number of matches to retrieve (default: 5)
     
     Returns:
         JSON array of match IDs
     """
-    api_key = request.args.get("api_key")
+    api_key = resolve_api_key(request.args.get("api_key"))
     if not api_key:
-        return jsonify({"error": "Missing API key"}), 400
+        return jsonify({"error": "Missing API key (query, RIOT_API_KEY, or Data/riotApiKey.txt)"}), 400
 
     # Parse and validate pagination parameters
     start = request.args.get("start", "0")
-    count = request.args.get("count", "20")
+    count = request.args.get("count", str(DEFAULT_MATCH_COUNT))
     
     try:
         start = int(start)
@@ -105,7 +125,6 @@ def get_matches(puuid):
 
     # Fetch matches from Riot API
     headers = {'X-Riot-Token': api_key}
-    # Note that For development keys, Riot enforces: 20 requests per second, 100 requests every 2 minutes (120s)
     url = f"https://{MATCH_REGION}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={count}"
     r = requests.get(url, headers=headers)
     
@@ -125,12 +144,12 @@ def get_more_matches(puuid):
     
     Parameters and functionality are identical to get_matches.
     """
-    api_key = request.args.get("api_key")
+    api_key = resolve_api_key(request.args.get("api_key"))
     if not api_key:
-        return jsonify({"error": "Missing API key"}), 400
+        return jsonify({"error": "Missing API key (query, RIOT_API_KEY, or Data/riotApiKey.txt)"}), 400
 
     start = request.args.get("start", "0")
-    count = request.args.get("count", "20")
+    count = request.args.get("count", str(DEFAULT_MATCH_COUNT))
     
     try:
         start = int(start)
@@ -162,9 +181,9 @@ def get_match_data(match_id):
     Returns:
         JSON object containing match metadata and timeline data
     """
-    api_key = request.args.get("api_key")
+    api_key = resolve_api_key(request.args.get("api_key"))
     if not api_key:
-        return jsonify({"error": "Missing API key"}), 400
+        return jsonify({"error": "Missing API key (query, RIOT_API_KEY, or Data/riotApiKey.txt)"}), 400
 
     # Always fetch fresh data from Riot API (no database caching)
     headers = {'X-Riot-Token': api_key}
@@ -204,13 +223,5 @@ def replay_page():
     return render_template('replay.html')
 
 if __name__ == "__main__":
-    # Local 
-    #app.run(debug=True)
-
-    # AWS
-    # eb init -p python-3.9 lol-replay --region us-west-3
-    # eb create lol-replay-env
-    # eb deploy
-    # eb open
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 5050))
     app.run(host='0.0.0.0', port=port)

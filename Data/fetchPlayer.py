@@ -6,13 +6,16 @@ Example: python Data/fetchPlayer.py --region na1 --queue RANKED_SOLO_5x5
 
 For each run, data goes under Data/players/<region>-<queue>-<timestamp>/ as flat files:
 challenger-grandmaster.jsonl, master.jsonl, diamondI.jsonl through diamondIV.jsonl.
-Each line is JSON: username, tag, puuid, sourceTier.
+Each line is JSON: username, tag.
 
 Work is split into six jobs (see tierJobsSpec). With one key, jobs run in order in this
 process. With several keys, one worker process is started per key and a small scheduler keeps
 up to that many jobs running; each job writes its own filename so outputs never collide.
 
 CLI: --region (e.g. na1, euw1, kr), --queue (e.g. RANKED_SOLO_5x5, RANKED_FLEX_SR).
+
+# Note: Full ranked player download (all Challenger through Diamond IV, for all divisions)
+# takes approximately 10 hours to complete.
 """
 
 from __future__ import annotations
@@ -290,12 +293,15 @@ def resolveAndWriteEntries(
     with outPath.open("w", encoding="utf-8") as outFile:
         for entry in entries:
             try:
-                puuid = entry.get("puuid")
-                if not puuid:
-                    summonerId = entry.get("summonerId")
-                    if not summonerId:
-                        raise KeyError("Missing both 'puuid' and 'summonerId' in league entry")
+                # League entries can contain a "puuid" field that is not always usable for Match-v5.
+                # Prefer resolving via summoner-v4 when summonerId exists; fallback to entry["puuid"].
+                summonerId = entry.get("summonerId")
+                if summonerId:
                     puuid = getPuuidFromSummonerId(region, summonerId)
+                else:
+                    puuid = entry.get("puuid")
+                    if not puuid:
+                        raise KeyError("Missing both 'puuid' and 'summonerId' in league entry")
 
                 if puuid in seenPuuids:
                     continue
@@ -305,15 +311,13 @@ def resolveAndWriteEntries(
                 playerRow = {
                     "username": riotId["gameName"],
                     "tag": riotId["tagLine"],
-                    "puuid": puuid,
-                    "sourceTier": entry.get("sourceTier", "unknown"),
                 }
                 outFile.write(json.dumps(playerRow, ensure_ascii=False) + "\n")
                 seenPuuids.add(puuid)
 
                 print(
                     f"[{workerLabel}] {riotId['gameName']}#{riotId['tagLine']} "
-                    f"(tier={playerRow['sourceTier']})"
+                    f"(tier={entry.get('sourceTier', 'unknown')})"
                 )
             except Exception as error:
                 summonerLabel = (

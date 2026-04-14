@@ -1,33 +1,74 @@
 """
-Process one match and write analysis logs to Data/log/<matchId>/.
+Process raw match and timeline JSON into logs and parsedData under Data/log/.
 
-How to run:
-- python Data/processMatch.py --matchId NA1_5286644426
-- python Data/processMatch.py  (process all matches under Data/matches)
+No Riot API calls: work is local JSON only. Uses up to one worker process per CPU core (capped by
+the number of division jobs) so divisions are processed in parallel as fast as this machine allows.
+
+Example:
+  python Data/processMatch.py na1-ranked-solo-5x5-20260413-235836
+
+You pass only the fetchMatch run folder name. The script reads Data/matches/<runName>/ and pairs
+each division subfolder with Data/timelines/<runName>/<division>/.
+
+Expects the same on-disk layout as fetchMatch: under Data/matches/<run>/ one subfolder per
+division, each with *.json match files, paired with Data/timelines/<run>/<division>/*. Each
+division folder is one job; a small scheduler keeps up to N workers busy until all divisions
+finish (N = min(job count, CPU count)).
+
+Writes:
+  Data/log/<run-folder-name>/<division-stem>/<matchId>/events.log
+  Data/log/<run-folder-name>/<division-stem>/<matchId>/timelines.log
+  Data/log/<run-folder-name>/<division-stem>/<matchId>/parsedData.json
+
+CLI: one positional argument, the run folder name (e.g. na1-ranked-solo-5x5-20260413-235836).
 """
+
+
+#Todo: If user's gold reduced, they backed, add that into consideration
+from __future__ import annotations
 
 import argparse
 import json
 import math
+import multiprocessing
+import os
 from pathlib import Path
-from typing import Dict, List
-
+from typing import Dict, List, Set
 
 dataDir = Path(__file__).resolve().parent
 matchesDir = dataDir / "matches"
 timelinesDir = dataDir / "timelines"
 logRootDir = dataDir / "log"
 
+workerShutdown = None
+
+
+def resolveMatchesRunDir(runName: str) -> Path:
+    """Data/matches/<basename(runName)>/ must exist."""
+    name = Path(runName.strip()).name
+    if not name:
+        raise RuntimeError("Run name is empty.")
+    root = (matchesDir / name).resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"Matches run folder not found: {root}")
+    return root
+
+
+def workerProcessCount(numJobs: int) -> int:
+    """Use all logical CPUs, but never more processes than division jobs."""
+    if numJobs <= 0:
+        return 0
+    cpus = os.cpu_count() or 1
+    return max(1, min(numJobs, cpus))
+
 
 def msToMinSec(ms: int) -> str:
-    """Convert milliseconds into MM:SS format."""
     minutes = ms // 60000
     seconds = (ms % 60000) // 1000
     return f"{minutes}:{seconds:02d}"
 
 
 def calculateDeathTimer(level: int, gameMinutes: float) -> int:
-    """Calculate respawn timer from level and game time."""
     baseRespawnWindow = [-1, 10, 10, 12, 12, 14, 16, 20, 25, 28, 32.5, 35, 37.5, 40, 42.5, 45, 47.5, 50, 52.5]
     clampedLevel = min(max(level, 1), 18)
     baseTimer = baseRespawnWindow[clampedLevel]
@@ -46,7 +87,6 @@ def calculateDeathTimer(level: int, gameMinutes: float) -> int:
 
 
 def getChampLabel(playerId: int, championMap: Dict[str, Dict[str, str]]) -> str:
-    """Format champion label with team icon."""
     playerKey = str(playerId)
     champion = championMap.get(playerKey, {}).get("champion", f"Champion {playerKey}")
     team = championMap.get(playerKey, {}).get("team", "Unknown")
@@ -56,7 +96,6 @@ def getChampLabel(playerId: int, championMap: Dict[str, Dict[str, str]]) -> str:
 
 
 def buildChampionMap(matchMeta: Dict) -> Dict[str, Dict[str, str]]:
-    """Map participantId -> champion/team label."""
     championMap: Dict[str, Dict[str, str]] = {}
     for participant in matchMeta["info"]["participants"]:
         playerKey = str(participant["participantId"])
@@ -68,7 +107,6 @@ def buildChampionMap(matchMeta: Dict) -> Dict[str, Dict[str, str]]:
 
 
 def buildTimelineData(frames: List[Dict]) -> Dict[str, List[Dict]]:
-    """Build per-participant timeline rows from frame data."""
     participantData: Dict[str, List[Dict]] = {str(i): [] for i in range(1, 11)}
     for frame in frames:
         timestampMs = frame["timestamp"]
@@ -90,7 +128,6 @@ def buildTimelineData(frames: List[Dict]) -> Dict[str, List[Dict]]:
 
 
 def buildEventData(frames: List[Dict]) -> List[Dict]:
-    """Extract important events from frames."""
     events: List[Dict] = []
     for frame in frames:
         for event in frame.get("events", []):
@@ -128,7 +165,6 @@ def buildEventData(frames: List[Dict]) -> List[Dict]:
 
 
 def buildEventLines(events: List[Dict], championMap: Dict[str, Dict[str, str]]) -> List[str]:
-    """Create human-readable event log lines."""
     lines: List[str] = []
     levelByPlayer = {str(i): 1 for i in range(1, 11)}
 
@@ -176,7 +212,6 @@ def buildEventLines(events: List[Dict], championMap: Dict[str, Dict[str, str]]) 
 
 
 def buildTimelineLines(participantData: Dict[str, List[Dict]], championMap: Dict[str, Dict[str, str]]) -> List[str]:
-    """Create human-readable movement log lines."""
     lines: List[str] = []
     for playerKey in sorted(participantData.keys(), key=int):
         champion = championMap[playerKey]["champion"]
@@ -192,18 +227,15 @@ def buildTimelineLines(participantData: Dict[str, List[Dict]], championMap: Dict
 
 
 def saveText(path: Path, lines: List[str]) -> None:
-    """Save text lines to file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def processOneMatch(matchId: str) -> None:
-    """Process one match id and write logs into Data/log/<matchId>/."""
-    timelinePath = timelinesDir / f"{matchId}_timeline.json"
-    matchPath = matchesDir / f"{matchId}.json"
+def processOneMatchFiles(matchPath: Path, timelinePath: Path, logDir: Path) -> bool:
+    """Load pair of JSON files and write logs under logDir. Returns True if processed."""
     if not timelinePath.exists() or not matchPath.exists():
-        return
+        return False
 
-    logDir = logRootDir / matchId
     logDir.mkdir(parents=True, exist_ok=True)
 
     timeline = json.loads(timelinePath.read_text(encoding="utf-8"))
@@ -222,20 +254,163 @@ def processOneMatch(matchId: str) -> None:
     saveText(logDir / "events.log", buildEventLines(events, championMap))
     saveText(logDir / "timelines.log", buildTimelineLines(participantData, championMap))
     (logDir / "parsedData.json").write_text(json.dumps(parsedData, indent=2), encoding="utf-8")
+    return True
+
+
+def processDivisionJob(task: Dict) -> None:
+    """All *.json matches under one division folder (paired with timelines/<run>/<division>/)."""
+    runName = task["runName"]
+    divisionLabel = task["divisionLabel"]
+    matchesDivisionDir = Path(task["matchesDivisionDir"])
+    timelinesDivisionDir = Path(task["timelinesDivisionDir"])
+    dataDirPath = Path(task["dataDirStr"])
+
+    matchFiles = sorted(matchesDivisionDir.glob("*.json"))
+    print(f"[{divisionLabel}] {len(matchFiles)} match file(s) under {matchesDivisionDir.name}")
+
+    for matchPath in matchFiles:
+        matchId = matchPath.stem
+        timelinePath = timelinesDivisionDir / f"{matchId}_timeline.json"
+        logDir = dataDirPath / "log" / runName / divisionLabel / matchId
+        if processOneMatchFiles(matchPath, timelinePath, logDir):
+            print(f"[{divisionLabel}] Processed {matchId}")
+        else:
+            print(f"[{divisionLabel}] Skip {matchId}: missing timeline or match")
+
+
+def buildDivisionTasks(matchesRunRoot: Path) -> List[Dict]:
+    runName = matchesRunRoot.name
+    dataDirStr = str(dataDir.resolve())
+    tasks: List[Dict] = []
+
+    for divisionDir in sorted(matchesRunRoot.iterdir()):
+        if not divisionDir.is_dir():
+            continue
+        divisionLabel = divisionDir.name
+        if not any(divisionDir.glob("*.json")):
+            continue
+        tasks.append(
+            {
+                "runName": runName,
+                "divisionLabel": divisionLabel,
+                "matchesDivisionDir": str(divisionDir.resolve()),
+                "timelinesDivisionDir": str((timelinesDir / runName / divisionLabel).resolve()),
+                "dataDirStr": dataDirStr,
+            }
+        )
+    return tasks
+
+
+def divisionWorkerLoop(
+    taskQueue: "multiprocessing.Queue",
+    doneQueue: "multiprocessing.Queue",
+) -> None:
+    while True:
+        item = taskQueue.get()
+        if item is workerShutdown:
+            break
+        task = item
+        try:
+            processDivisionJob(task)
+            doneQueue.put(task["divisionLabel"])
+        except Exception as exc:
+            label = task.get("divisionLabel", "?") if isinstance(task, dict) else "?"
+            print(f"[worker] failed job {label}: {exc}")
+            doneQueue.put(("__error__", str(exc)))
+
+
+def runDynamicDivisionPool(tasks: List[Dict]) -> None:
+    numJobs = len(tasks)
+    numWorkers = workerProcessCount(numJobs)
+
+    if numJobs == 0:
+        print("No division folders with match JSON found.")
+        return
+
+    if numWorkers == 1:
+        for task in tasks:
+            processDivisionJob(task)
+        return
+
+    manager = multiprocessing.Manager()
+    taskQueue = manager.Queue()
+    doneQueue = manager.Queue()
+
+    workers: List[multiprocessing.Process] = []
+    for _ in range(numWorkers):
+        proc = multiprocessing.Process(
+            target=divisionWorkerLoop,
+            args=(taskQueue, doneQueue),
+        )
+        proc.start()
+        workers.append(proc)
+
+    inFlight: Set[str] = set()
+    nextJobIndex = 0
+
+    def tryDispatch() -> None:
+        nonlocal nextJobIndex
+        while len(inFlight) < numWorkers and nextJobIndex < numJobs:
+            task = tasks[nextJobIndex]
+            nextJobIndex += 1
+            taskQueue.put(task)
+            inFlight.add(task["divisionLabel"])
+            print(
+                f"[scheduler] dispatched {task['divisionLabel']} "
+                f"(running: {sorted(inFlight)})"
+            )
+
+    tryDispatch()
+
+    while inFlight or nextJobIndex < numJobs:
+        if not inFlight:
+            if nextJobIndex >= numJobs:
+                break
+            tryDispatch()
+            if not inFlight:
+                continue
+
+        finished = doneQueue.get()
+        if isinstance(finished, tuple) and finished[0] == "__error__":
+            for _ in workers:
+                taskQueue.put(workerShutdown)
+            raise RuntimeError(finished[1])
+        inFlight.discard(finished)
+        print(f"[scheduler] finished {finished} (running: {sorted(inFlight)})")
+        tryDispatch()
+
+    for _ in workers:
+        taskQueue.put(workerShutdown)
+    for proc in workers:
+        proc.join(timeout=600)
+        if proc.is_alive():
+            proc.terminate()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Process a match into analysis logs under Data/log/<matchId>/")
-    parser.add_argument("--matchId", required=False, help="Match id like NA1_5286644426")
+    parser = argparse.ArgumentParser(
+        description="Process match JSON into logs for one fetchMatch run under Data/matches/<runName>/."
+    )
+    parser.add_argument(
+        "runName",
+        help="Run folder name only, e.g. na1-ranked-solo-5x5-20260413-235836 (uses Data/matches/<runName>/)",
+    )
     args = parser.parse_args()
 
-    if args.matchId:
-        processOneMatch(args.matchId)
-        return
+    matchesRunRoot = resolveMatchesRunDir(args.runName)
+    tasks = buildDivisionTasks(matchesRunRoot)
 
-    for matchFile in sorted(matchesDir.glob("*.json")):
-        matchId = matchFile.stem
-        processOneMatch(matchId)
+    print(f"Matches run: {matchesRunRoot}")
+    if not tasks:
+        print("No division folders with match JSON found.")
+        return
+    numWorkers = workerProcessCount(len(tasks))
+    print(f"Jobs ({len(tasks)}): " + " → ".join(t["divisionLabel"] for t in tasks))
+    print(f"Worker processes: {numWorkers} (min of job count and CPU count)")
+    print(f"Log root: {logRootDir / matchesRunRoot.name}/<division>/<matchId>/")
+
+    runDynamicDivisionPool(tasks)
+    print("\nDone.")
 
 
 if __name__ == "__main__":
