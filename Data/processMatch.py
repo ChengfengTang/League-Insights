@@ -1,30 +1,10 @@
 """
-Process raw match and timeline JSON into logs and parsedData under Data/log/.
-
-No Riot API calls: work is local JSON only. Uses up to one worker process per CPU core (capped by
-the number of division jobs) so divisions are processed in parallel as fast as this machine allows.
+Process raw match and timeline JSON into one ML-ready `<matchId>.jsonl` per match.
 
 Example:
-  python Data/processMatch.py na1-ranked-solo-5x5-20260413-235836
-
-You pass only the fetchMatch run folder name. The script reads Data/matches/<runName>/ and pairs
-each division subfolder with Data/timelines/<runName>/<division>/.
-
-Expects the same on-disk layout as fetchMatch: under Data/matches/<run>/ one subfolder per
-division, each with *.json match files, paired with Data/timelines/<run>/<division>/*. Each
-division folder is one job; a small scheduler keeps up to N workers busy until all divisions
-finish (N = min(job count, CPU count)).
-
-Writes:
-  Data/log/<run-folder-name>/<division-stem>/<matchId>/events.log
-  Data/log/<run-folder-name>/<division-stem>/<matchId>/timelines.log
-  Data/log/<run-folder-name>/<division-stem>/<matchId>/parsedData.json
-
-CLI: one positional argument, the run folder name (e.g. na1-ranked-solo-5x5-20260413-235836).
+  python3 Data/processMatch.py na1-ranked-solo-5x5-20260413-235836
 """
 
-
-#Todo: If user's gold reduced, they backed, add that into consideration
 from __future__ import annotations
 
 import argparse
@@ -32,8 +12,10 @@ import json
 import math
 import multiprocessing
 import os
+import shutil
+import time
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 dataDir = Path(__file__).resolve().parent
 matchesDir = dataDir / "matches"
@@ -41,6 +23,19 @@ timelinesDir = dataDir / "timelines"
 logRootDir = dataDir / "log"
 
 workerShutdown = None
+DEFAULT_TARGET_HORIZON_MS = 60000
+NEARBY_EVENT_RADIUS = 2500.0
+PROGRESS_BAR_WIDTH = 30
+PROGRESS_PRINT_EVERY_COUNT = 100
+PROGRESS_PRINT_EVERY_SECONDS = 10.0
+
+
+def formatProgressBar(done: int, total: int) -> str:
+    total = max(1, int(total))
+    done = max(0, min(int(done), total))
+    filled = int((done / total) * PROGRESS_BAR_WIDTH)
+    bar = "=" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+    return f"[{bar}] {done}/{total}"
 
 
 def resolveMatchesRunDir(runName: str) -> Path:
@@ -55,75 +50,113 @@ def resolveMatchesRunDir(runName: str) -> Path:
 
 
 def workerProcessCount(numJobs: int) -> int:
-    """Use all logical CPUs, but never more processes than division jobs."""
+    """Use exactly one worker per division job."""
     if numJobs <= 0:
         return 0
-    cpus = os.cpu_count() or 1
-    return max(1, min(numJobs, cpus))
+    return max(1, numJobs)
 
 
-def msToMinSec(ms: int) -> str:
-    minutes = ms // 60000
-    seconds = (ms % 60000) // 1000
-    return f"{minutes}:{seconds:02d}"
+def distanceBetween(x1: Optional[float], y1: Optional[float], x2: Optional[float], y2: Optional[float]) -> Optional[float]:
+    if None in (x1, y1, x2, y2):
+        return None
+    return math.hypot(x2 - x1, y2 - y1)
 
 
-def calculateDeathTimer(level: int, gameMinutes: float) -> int:
-    baseRespawnWindow = [-1, 10, 10, 12, 12, 14, 16, 20, 25, 28, 32.5, 35, 37.5, 40, 42.5, 45, 47.5, 50, 52.5]
-    clampedLevel = min(max(level, 1), 18)
-    baseTimer = baseRespawnWindow[clampedLevel]
+def buildStaticMatchContext(matchMeta: Dict) -> Dict:
+    info = matchMeta.get("info", {})
+    participantsRaw = info.get("participants", [])
+    teamsRaw = info.get("teams", [])
 
-    if gameMinutes < 15:
-        timeImpactFactor = 0
-    elif gameMinutes < 30:
-        timeImpactFactor = math.ceil(2 * (gameMinutes - 15)) * 0.425 / 100
-    elif gameMinutes < 45:
-        timeImpactFactor = 12.75 / 60 + math.ceil(2 * (gameMinutes - 30)) * 0.30 / 100
-    else:
-        timeImpactFactor = 21.75 / 60 + math.ceil(2 * (gameMinutes - 45)) * 1.45 / 100
+    participants: List[Dict] = []
+    blueJungler: Dict = {}
+    redJungler: Dict = {}
 
-    totalTimer = baseTimer * (1 + timeImpactFactor)
-    return round(totalTimer)
-
-
-def getChampLabel(playerId: int, championMap: Dict[str, Dict[str, str]]) -> str:
-    playerKey = str(playerId)
-    champion = championMap.get(playerKey, {}).get("champion", f"Champion {playerKey}")
-    team = championMap.get(playerKey, {}).get("team", "Unknown")
-    if team == "Blue":
-        return f"Blue {champion}"
-    return f"Red {champion}"
-
-
-def buildChampionMap(matchMeta: Dict) -> Dict[str, Dict[str, str]]:
-    championMap: Dict[str, Dict[str, str]] = {}
-    for participant in matchMeta["info"]["participants"]:
-        playerKey = str(participant["participantId"])
-        championMap[playerKey] = {
-            "champion": participant["championName"],
-            "team": "Blue" if participant["teamId"] == 100 else "Red",
+    for participant in participantsRaw:
+        entry = {
+            "participantId": participant.get("participantId"),
+            "teamId": participant.get("teamId"),
+            "championId": participant.get("championId"),
+            "championName": participant.get("championName"),
+            "teamPosition": participant.get("teamPosition"),
+            "individualPosition": participant.get("individualPosition"),
+            "lane": participant.get("lane"),
+            "role": participant.get("role"),
+            "summoner1Id": participant.get("summoner1Id"),
+            "summoner2Id": participant.get("summoner2Id"),
         }
-    return championMap
+        participants.append(entry)
+
+        if participant.get("teamPosition") == "JUNGLE":
+            jungleEntry = {
+                "participantId": participant.get("participantId"),
+                "championId": participant.get("championId"),
+                "championName": participant.get("championName"),
+            }
+            if participant.get("teamId") == 100:
+                blueJungler = jungleEntry
+            elif participant.get("teamId") == 200:
+                redJungler = jungleEntry
+
+    teams: List[Dict] = []
+    for team in teamsRaw:
+        teams.append(
+            {
+                "teamId": team.get("teamId"),
+                "win": team.get("win"),
+                "objectives": team.get("objectives", {}),
+            }
+        )
+
+    return {
+        "rowType": "static_match_context",
+        "matchId": matchMeta.get("metadata", {}).get("matchId"),
+        "gameVersion": info.get("gameVersion"),
+        "queueId": info.get("queueId"),
+        "mapId": info.get("mapId"),
+        "gameDuration": info.get("gameDuration"),
+        "gameStartTimestamp": info.get("gameStartTimestamp"),
+        "teams": teams,
+        "participants": participants,
+        "blueJungler": blueJungler,
+        "redJungler": redJungler,
+    }
 
 
-def buildTimelineData(frames: List[Dict]) -> Dict[str, List[Dict]]:
-    participantData: Dict[str, List[Dict]] = {str(i): [] for i in range(1, 11)}
+def buildParticipantIndex(matchMeta: Dict) -> Dict[int, Dict]:
+    byId: Dict[int, Dict] = {}
+    for participant in matchMeta.get("info", {}).get("participants", []):
+        participantId = participant.get("participantId")
+        if isinstance(participantId, int):
+            byId[participantId] = participant
+    return byId
+
+
+def buildTimelineData(frames: List[Dict]) -> Dict[int, List[Dict]]:
+    participantData: Dict[int, List[Dict]] = {i: [] for i in range(1, 11)}
     for frame in frames:
         timestampMs = frame["timestamp"]
-        timeLabel = msToMinSec(timestampMs)
         for playerKey, participantFrame in frame["participantFrames"].items():
             if "position" not in participantFrame:
                 continue
+            championStats = participantFrame.get("championStats", {})
+            participantId = int(playerKey)
             row = {
+                "frameIndex": len(participantData[participantId]),
                 "timestampMs": timestampMs,
-                "time": timeLabel,
                 "x": participantFrame["position"]["x"],
                 "y": participantFrame["position"]["y"],
                 "level": participantFrame.get("level", 1),
-                "cs": participantFrame.get("jungleMinionsKilled", 0) + participantFrame.get("minionsKilled", 0),
-                "gold": participantFrame.get("currentGold", 0),
+                "xp": participantFrame.get("xp", 0),
+                "currentGold": participantFrame.get("currentGold", 0),
+                "totalGold": participantFrame.get("totalGold", 0),
+                "csJungle": participantFrame.get("jungleMinionsKilled", 0),
+                "csLane": participantFrame.get("minionsKilled", 0),
+                "hp": championStats.get("health", 0),
+                "hpMax": championStats.get("healthMax", 0),
+                "movementSpeed": championStats.get("movementSpeed", 0),
+                "timeEnemySpentControlled": participantFrame.get("timeEnemySpentControlled", 0),
             }
-            participantData[playerKey].append(row)
+            participantData[participantId].append(row)
     return participantData
 
 
@@ -132,31 +165,27 @@ def buildEventData(frames: List[Dict]) -> List[Dict]:
     for frame in frames:
         for event in frame.get("events", []):
             timestampMs = event["timestamp"]
-            timeLabel = msToMinSec(timestampMs)
             eventType = event["type"]
-            eventRow = {"timestampMs": timestampMs, "time": timeLabel, "type": eventType}
-
             if eventType == "CHAMPION_KILL":
-                eventRow.update(
-                    {
-                        "actor": event.get("killerId"),
-                        "victim": event.get("victimId"),
-                        "x": event.get("position", {}).get("x"),
-                        "y": event.get("position", {}).get("y"),
-                        "assists": event.get("assistingParticipantIds", []),
-                    }
-                )
+                eventRow = {
+                    "timestampMs": timestampMs,
+                    "type": eventType,
+                    "x": event.get("position", {}).get("x"),
+                    "y": event.get("position", {}).get("y"),
+                    "killerId": event.get("killerId"),
+                    "victim": event.get("victimId"),
+                    "assists": event.get("assistingParticipantIds", []),
+                }
             elif eventType == "ELITE_MONSTER_KILL":
-                eventRow.update(
-                    {
-                        "actor": event.get("killerId"),
-                        "monster": event.get("monsterType"),
-                        "x": event.get("position", {}).get("x"),
-                        "y": event.get("position", {}).get("y"),
-                    }
-                )
-            elif eventType == "LEVEL_UP":
-                eventRow.update({"actor": event.get("participantId"), "level": event.get("level")})
+                eventRow = {
+                    "timestampMs": timestampMs,
+                    "type": eventType,
+                    "x": event.get("position", {}).get("x"),
+                    "y": event.get("position", {}).get("y"),
+                    "killerId": event.get("killerId"),
+                    "monster": event.get("monsterType"),
+                    "monsterSubType": event.get("monsterSubType"),
+                }
             else:
                 continue
 
@@ -164,96 +193,226 @@ def buildEventData(frames: List[Dict]) -> List[Dict]:
     return events
 
 
-def buildEventLines(events: List[Dict], championMap: Dict[str, Dict[str, str]]) -> List[str]:
-    lines: List[str] = []
-    levelByPlayer = {str(i): 1 for i in range(1, 11)}
+def getJunglerIds(staticMatchContext: Dict) -> List[int]:
+    junglerIds: List[int] = []
+    for jungler in (staticMatchContext.get("blueJungler", {}), staticMatchContext.get("redJungler", {})):
+        participantId = jungler.get("participantId")
+        if isinstance(participantId, int):
+            junglerIds.append(participantId)
+    return junglerIds
+
+
+def filterEventsForJunglers(events: List[Dict], junglerIds: List[int]) -> List[Dict]:
+    junglerIdSet = set(junglerIds)
+    filtered: List[Dict] = []
+    for event in events:
+        if event.get("x") is None or event.get("y") is None:
+            continue
+
+        killerId = event.get("killerId")
+        victimId = event.get("victim")
+        assists = event.get("assists", [])
+        if killerId in junglerIdSet or victimId in junglerIdSet or any(assistId in junglerIdSet for assistId in assists):
+            filtered.append(event)
+    return filtered
+
+
+def buildRecentEventFeatures(
+    events: List[Dict],
+    participantRow: Dict,
+    participantId: int,
+    participantTeamId: int,
+    timestampMs: int,
+) -> Dict:
+    recentKillCount = 0
+    recentObjectiveCount = 0
+    recentDeathNearby = 0
+    nearestKillDistance: Optional[float] = None
+    nearestObjectiveDistance: Optional[float] = None
+    timeSinceLastDragonMs: Optional[int] = None
+    timeSinceLastHeraldMs: Optional[int] = None
+    timeSinceLastBaronMs: Optional[int] = None
+
+    x = participantRow["x"]
+    y = participantRow["y"]
 
     for event in events:
-        timeLabel = event["time"]
-        eventType = event["type"]
+        eventTs = event["timestampMs"]
+        if eventTs > timestampMs:
+            break
+        ageMs = timestampMs - eventTs
 
-        if eventType == "CHAMPION_KILL":
-            killer = event.get("actor")
-            victim = event.get("victim")
-            xValue = event.get("x", "?")
-            yValue = event.get("y", "?")
-            killerLabel = getChampLabel(killer, championMap)
-            victimLabel = getChampLabel(victim, championMap)
-            lines.append(f"{timeLabel} - {killerLabel} killed {victimLabel} at ({xValue}, {yValue})")
+        if event["type"] == "CHAMPION_KILL" and ageMs <= 60000:
+            distance = distanceBetween(x, y, event.get("x"), event.get("y"))
+            if distance is not None and distance <= NEARBY_EVENT_RADIUS:
+                recentKillCount += 1
+                nearestKillDistance = distance if nearestKillDistance is None else min(nearestKillDistance, distance)
+                if event.get("victim") == participantId:
+                    recentDeathNearby += 1
 
-            for assistPlayerId in event.get("assists", []):
-                assistLabel = getChampLabel(assistPlayerId, championMap)
-                lines.append(f"{timeLabel} - {assistLabel} assisted at ({xValue}, {yValue})")
-
-            victimLevel = levelByPlayer.get(str(victim), 1)
-            deathTimer = calculateDeathTimer(victimLevel, int(timeLabel.split(":")[0]))
-            nowSec = int(timeLabel.split(":")[0]) * 60 + int(timeLabel.split(":")[1])
-            respawnSec = nowSec + deathTimer
-            respawnLabel = f"{respawnSec // 60}:{respawnSec % 60:02d}"
-            lines.append(f"{timeLabel} - {victimLabel} died at ({xValue}, {yValue})")
-            lines.append(f"{respawnLabel} - {victimLabel} respawn")
-
-        elif eventType == "ELITE_MONSTER_KILL":
-            killer = event.get("actor")
+        if event["type"] == "ELITE_MONSTER_KILL":
             monster = event.get("monster")
-            xValue = event.get("x", "?")
-            yValue = event.get("y", "?")
-            killerLabel = getChampLabel(killer, championMap)
-            lines.append(f"{timeLabel} - {killerLabel} killed {monster} at ({xValue}, {yValue})")
+            if monster == "DRAGON":
+                timeSinceLastDragonMs = ageMs
+            elif monster == "RIFTHERALD":
+                timeSinceLastHeraldMs = ageMs
+            elif monster == "BARON_NASHOR":
+                timeSinceLastBaronMs = ageMs
 
-        elif eventType == "LEVEL_UP":
-            playerId = event.get("actor")
-            level = event.get("level")
-            levelByPlayer[str(playerId)] = level
-            playerLabel = getChampLabel(playerId, championMap)
-            lines.append(f"{timeLabel} - {playerLabel} leveled up to {level}")
+            if ageMs <= 90000:
+                distance = distanceBetween(x, y, event.get("x"), event.get("y"))
+                if distance is not None and distance <= 5000.0:
+                    recentObjectiveCount += 1
+                    nearestObjectiveDistance = (
+                        distance if nearestObjectiveDistance is None else min(nearestObjectiveDistance, distance)
+                    )
 
-    return lines
+    return {
+        "nearbyChampionKillsLast60s": recentKillCount,
+        "nearbyDeathsLast60s": recentDeathNearby,
+        "nearbyObjectiveEventsLast90s": recentObjectiveCount,
+        "nearestChampionKillDistance": nearestKillDistance,
+        "nearestObjectiveDistance": nearestObjectiveDistance,
+        "timeSinceLastDragonMs": timeSinceLastDragonMs,
+        "timeSinceLastHeraldMs": timeSinceLastHeraldMs,
+        "timeSinceLastBaronMs": timeSinceLastBaronMs,
+        "isBlueSide": participantTeamId == 100,
+    }
 
 
-def buildTimelineLines(participantData: Dict[str, List[Dict]], championMap: Dict[str, Dict[str, str]]) -> List[str]:
-    lines: List[str] = []
-    for playerKey in sorted(participantData.keys(), key=int):
-        champion = championMap[playerKey]["champion"]
-        team = championMap[playerKey]["team"]
-        lines.append(f"{team} {champion}")
-        for row in participantData[playerKey]:
-            lines.append(
-                f"  {row['time']} - Position ({row['x']}, {row['y']}) | "
-                f"Level {row['level']} | CS {row['cs']} | Gold {row['gold']}"
+def buildJunglerTrainingRows(
+    staticMatchContext: Dict,
+    participantIndex: Dict[int, Dict],
+    participantTimelineData: Dict[int, List[Dict]],
+    events: List[Dict],
+    targetHorizonMs: int = DEFAULT_TARGET_HORIZON_MS,
+) -> List[Dict]:
+    junglerIds = getJunglerIds(staticMatchContext)
+
+    rows: List[Dict] = []
+    for participantId in junglerIds:
+        participantMeta = participantIndex.get(participantId, {})
+        timelineRows = participantTimelineData.get(participantId, [])
+        for idx, row in enumerate(timelineRows):
+            previousRow = timelineRows[idx - 1] if idx > 0 else None
+            nextRow = timelineRows[idx + 1] if idx + 1 < len(timelineRows) else None
+
+            hp = row.get("hp", 0)
+            hpMax = row.get("hpMax", 0)
+            hpRatio = None if not hpMax else round(hp / hpMax, 6)
+
+            dx1 = None
+            dy1 = None
+            distance1 = None
+            speedPerSec1 = None
+            timeDeltaMs1 = None
+            if previousRow is not None:
+                dx1 = row["x"] - previousRow["x"]
+                dy1 = row["y"] - previousRow["y"]
+                distance1 = round(math.hypot(dx1, dy1), 3)
+                timeDeltaMs1 = row["timestampMs"] - previousRow["timestampMs"]
+                if timeDeltaMs1 > 0:
+                    speedPerSec1 = round(distance1 / (timeDeltaMs1 / 1000.0), 6)
+
+            targetValid = False
+            targetX = None
+            targetY = None
+            targetDx = None
+            targetDy = None
+            if nextRow is not None and nextRow["timestampMs"] - row["timestampMs"] == targetHorizonMs:
+                targetValid = True
+                targetX = nextRow["x"]
+                targetY = nextRow["y"]
+                targetDx = nextRow["x"] - row["x"]
+                targetDy = nextRow["y"] - row["y"]
+
+            eventFeatures = buildRecentEventFeatures(
+                events=events,
+                participantRow=row,
+                participantId=participantId,
+                participantTeamId=participantMeta.get("teamId", 0),
+                timestampMs=row["timestampMs"],
             )
-        lines.append("")
-    return lines
+
+            rows.append(
+                {
+                    "rowType": "jungler_frame",
+                    "matchId": staticMatchContext.get("matchId"),
+                    "gameVersion": staticMatchContext.get("gameVersion"),
+                    "queueId": staticMatchContext.get("queueId"),
+                    "mapId": staticMatchContext.get("mapId"),
+                    "gameDuration": staticMatchContext.get("gameDuration"),
+                    "participantId": participantId,
+                    "teamId": participantMeta.get("teamId"),
+                    "championId": participantMeta.get("championId"),
+                    "championName": participantMeta.get("championName"),
+                    "teamPosition": participantMeta.get("teamPosition"),
+                    "individualPosition": participantMeta.get("individualPosition"),
+                    "summoner1Id": participantMeta.get("summoner1Id"),
+                    "summoner2Id": participantMeta.get("summoner2Id"),
+                    "frameIndex": row["frameIndex"],
+                    "timestampMs": row["timestampMs"],
+                    "x": row["x"],
+                    "y": row["y"],
+                    "level": row["level"],
+                    "xp": row["xp"],
+                    "currentGold": row["currentGold"],
+                    "totalGold": row["totalGold"],
+                    "csJungle": row["csJungle"],
+                    "csLane": row["csLane"],
+                    "hp": hp,
+                    "hpMax": hpMax,
+                    "hpRatio": hpRatio,
+                    "movementSpeed": row["movementSpeed"],
+                    "timeEnemySpentControlled": row["timeEnemySpentControlled"],
+                    "dx1": dx1,
+                    "dy1": dy1,
+                    "distance1": distance1,
+                    "speedPerSec1": speedPerSec1,
+                    "timeDeltaMs1": timeDeltaMs1,
+                    "targetHorizonMs": targetHorizonMs,
+                    "targetValid": targetValid,
+                    "targetX": targetX,
+                    "targetY": targetY,
+                    "targetDx": targetDx,
+                    "targetDy": targetDy,
+                    **eventFeatures,
+                }
+            )
+
+    return rows
 
 
-def saveText(path: Path, lines: List[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def processOneMatchFiles(matchPath: Path, timelinePath: Path, logDir: Path) -> bool:
-    """Load pair of JSON files and write logs under logDir. Returns True if processed."""
+def processOneMatchFiles(matchPath: Path, timelinePath: Path, outputPath: Path) -> bool:
+    """Load pair of JSON files and write one ML-ready JSON file. Returns True if processed."""
     if not timelinePath.exists() or not matchPath.exists():
         return False
 
-    logDir.mkdir(parents=True, exist_ok=True)
+    outputPath.parent.mkdir(parents=True, exist_ok=True)
 
     timeline = json.loads(timelinePath.read_text(encoding="utf-8"))
     matchMeta = json.loads(matchPath.read_text(encoding="utf-8"))
 
     frames = timeline["info"]["frames"]
-    championMap = buildChampionMap(matchMeta)
+    staticMatchContext = buildStaticMatchContext(matchMeta)
+    participantIndex = buildParticipantIndex(matchMeta)
     participantData = buildTimelineData(frames)
-    events = buildEventData(frames)
+    allEvents = buildEventData(frames)
+    junglerEvents = filterEventsForJunglers(allEvents, getJunglerIds(staticMatchContext))
+    trainingRows = buildJunglerTrainingRows(
+        staticMatchContext=staticMatchContext,
+        participantIndex=participantIndex,
+        participantTimelineData=participantData,
+        events=allEvents,
+    )
 
     parsedData = {
-        "timelines": [{"id": int(playerKey), "timeline": rows} for playerKey, rows in participantData.items()],
-        "events": events,
+        "matchContext": staticMatchContext,
+        "junglerTrainingRows": trainingRows,
+        "events": junglerEvents,
     }
 
-    saveText(logDir / "events.log", buildEventLines(events, championMap))
-    saveText(logDir / "timelines.log", buildTimelineLines(participantData, championMap))
-    (logDir / "parsedData.json").write_text(json.dumps(parsedData, indent=2), encoding="utf-8")
+    outputPath.write_text(json.dumps(parsedData, indent=2), encoding="utf-8")
     return True
 
 
@@ -266,17 +425,54 @@ def processDivisionJob(task: Dict) -> None:
     dataDirPath = Path(task["dataDirStr"])
 
     matchFiles = sorted(matchesDivisionDir.glob("*.json"))
-    print(f"[{divisionLabel}] {len(matchFiles)} match file(s) under {matchesDivisionDir.name}")
+    totalMatches = len(matchFiles)
+    processedMatches = 0
+    lastProgressCount = -1
+    lastProgressTime = 0.0
+
+    print(f"[{divisionLabel}] {formatProgressBar(0, max(1, totalMatches))}", flush=True)
 
     for matchPath in matchFiles:
         matchId = matchPath.stem
         timelinePath = timelinesDivisionDir / f"{matchId}_timeline.json"
-        logDir = dataDirPath / "log" / runName / divisionLabel / matchId
-        if processOneMatchFiles(matchPath, timelinePath, logDir):
-            print(f"[{divisionLabel}] Processed {matchId}")
-        else:
-            print(f"[{divisionLabel}] Skip {matchId}: missing timeline or match")
+        outputPath = dataDirPath / "log" / runName / divisionLabel / f"{matchId}.jsonl"
+        try:
+            if outputPath.exists():
+                # Already logged; clean up raw files if they still exist.
+                if matchPath.exists():
+                    matchPath.unlink()
+                if timelinePath.exists():
+                    timelinePath.unlink()
+                success = True
+            else:
+                success = processOneMatchFiles(matchPath, timelinePath, outputPath)
+                if success:
+                    # Delete raw inputs after successful logging.
+                    if matchPath.exists():
+                        matchPath.unlink()
+                    if timelinePath.exists():
+                        timelinePath.unlink()
+        except Exception as exc:
+            success = False
+            print(f"[{divisionLabel}] Failed {matchId}: {exc}", flush=True)
 
+        if not success:
+            print(f"[{divisionLabel}] Unsuccessful log for {matchId}", flush=True)
+
+        processedMatches += 1
+        now = time.time()
+        shouldPrint = (
+            processedMatches == totalMatches
+            or processedMatches - lastProgressCount >= PROGRESS_PRINT_EVERY_COUNT
+            or now - lastProgressTime >= PROGRESS_PRINT_EVERY_SECONDS
+        )
+        if shouldPrint:
+            print(
+                f"[{divisionLabel}] {formatProgressBar(processedMatches, totalMatches)}",
+                flush=True,
+            )
+            lastProgressCount = processedMatches
+            lastProgressTime = now
 
 def buildDivisionTasks(matchesRunRoot: Path) -> List[Dict]:
     runName = matchesRunRoot.name
@@ -315,7 +511,7 @@ def divisionWorkerLoop(
             doneQueue.put(task["divisionLabel"])
         except Exception as exc:
             label = task.get("divisionLabel", "?") if isinstance(task, dict) else "?"
-            print(f"[worker] failed job {label}: {exc}")
+            print(f"[worker] failed job {label}: {exc}", flush=True)
             doneQueue.put(("__error__", str(exc)))
 
 
@@ -355,10 +551,6 @@ def runDynamicDivisionPool(tasks: List[Dict]) -> None:
             nextJobIndex += 1
             taskQueue.put(task)
             inFlight.add(task["divisionLabel"])
-            print(
-                f"[scheduler] dispatched {task['divisionLabel']} "
-                f"(running: {sorted(inFlight)})"
-            )
 
     tryDispatch()
 
@@ -376,7 +568,6 @@ def runDynamicDivisionPool(tasks: List[Dict]) -> None:
                 taskQueue.put(workerShutdown)
             raise RuntimeError(finished[1])
         inFlight.discard(finished)
-        print(f"[scheduler] finished {finished} (running: {sorted(inFlight)})")
         tryDispatch()
 
     for _ in workers:
@@ -406,10 +597,12 @@ def main() -> None:
         return
     numWorkers = workerProcessCount(len(tasks))
     print(f"Jobs ({len(tasks)}): " + " → ".join(t["divisionLabel"] for t in tasks))
-    print(f"Worker processes: {numWorkers} (min of job count and CPU count)")
-    print(f"Log root: {logRootDir / matchesRunRoot.name}/<division>/<matchId>/")
+    print(f"Worker processes: {numWorkers} (one per division)")
+    print(f"Log root: {logRootDir / matchesRunRoot.name}/<division>/<matchId>.jsonl")
 
     runDynamicDivisionPool(tasks)
+    shutil.rmtree(matchesRunRoot, ignore_errors=True)
+    shutil.rmtree(timelinesDir / matchesRunRoot.name, ignore_errors=True)
     print("\nDone.")
 
 

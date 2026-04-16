@@ -1,7 +1,0 @@
-numpy
-pandas
-scikit-learn
-torch
-requests
-# Optional, for Data/fetchTopRankedPlayers.py and fetchdata.py when using MySQL:
-# mysql-connector-python

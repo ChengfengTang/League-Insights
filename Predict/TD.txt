@@ -50,6 +50,22 @@ How we will achieve it (implementation plan)
    (or fewer if unavailable), restrict to Ranked Solo/Duo on Summoner's Rift
    (queueId 420, mapId 11), and deduplicate by matchId across players so one
    unique match contributes all 10 participant timelines without duplicate files.
+   In the current `Data/processMatch.py` pipeline, each processed match is
+   written as `Data/log/<run>/<division>/<matchId>.jsonl` with three parts:
+   `matchContext`, `junglerTrainingRows`, and `events`. `matchContext` stores
+   the static information we know from champion select / loading screen or
+   match metadata: `matchId`, patch, queue/map, both teams, all participant
+   roles, summoner spells, and explicit blue/red jungler IDs/champions.
+   `junglerTrainingRows` is the main supervised table: one row per jungler per
+   frame containing current position, level, xp, current and total gold,
+   jungle/lane CS, hp and hp ratio, movement speed, recent deltas (`dx`, `dy`,
+   speed), nearby recent kill/death/objective pressure, objective recency, and
+   short-horizon future targets. `events` keeps only coordinate-bearing events
+   involving a jungler, mainly champion kills and epic monster kills, so we
+   retain spatial pressure signals while excluding non-spatial noise such as
+   `LEVEL_UP`. In practice, training uses `matchContext` as static conditioning,
+   `junglerTrainingRows` as the per-time-step input/label source, and `events`
+   as extra explanation for why a jungler changed route.
 
 2. Baselines  
    Persistence (same quadrant as last step) and low-order Markov models on

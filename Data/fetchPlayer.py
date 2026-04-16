@@ -54,8 +54,8 @@ numTierJobs = len(tierJobsSpec)
 
 workerShutdown = None  # task-queue sentinel so child processes exit their loops.
 PROGRESS_BAR_WIDTH = 30
-PROGRESS_PRINT_EVERY_COUNT = 50
-PROGRESS_PRINT_EVERY_SECONDS = 2.0
+PROGRESS_PRINT_EVERY_COUNT = 100
+PROGRESS_PRINT_EVERY_SECONDS = 10.0
 
 
 @dataclass
@@ -333,7 +333,7 @@ def resolveAndWriteEntries(
                     or entry.get("puuid")
                     or "<unknown-entry>"
                 )
-                print(f"[{workerLabel}] Error processing {summonerLabel}: {error}")
+                print(f"[{workerLabel}] Error processing {summonerLabel}: {error}", flush=True)
                 continue
             finally:
                 processedEntries += 1
@@ -344,7 +344,10 @@ def resolveAndWriteEntries(
                     or now - lastProgressTime >= PROGRESS_PRINT_EVERY_SECONDS
                 )
                 if shouldPrint:
-                    print(f"[{workerLabel}] {formatProgressBar(processedEntries, totalEntries)}")
+                    print(
+                        f"[{workerLabel}] {formatProgressBar(processedEntries, totalEntries)}",
+                        flush=True,
+                    )
                     lastProgressCount = processedEntries
                     lastProgressTime = now
 
@@ -371,7 +374,7 @@ def runTierJob(job: TierJob, region: str, queue: str, runDir: Path) -> None:
     """Fetch one league slice and write resolved rows to a flat file under runDir."""
     entries = materializeTierEntries(job, region, queue)
     outPath = jobJsonlPath(runDir, job)
-    print(f"[{job.outputFolder}] {formatProgressBar(0, max(1, len(entries)))}")
+    print(f"[{job.outputFolder}] {formatProgressBar(0, max(1, len(entries)))}", flush=True)
     resolveAndWriteEntries(entries, region, outPath, job.outputFolder)
 
 
@@ -394,7 +397,7 @@ def tierWorkerLoop(apiKey: str, taskQueue: "multiprocessing.Queue", doneQueue: "
             runTierJob(job, region, queue, Path(runDirStr))
             doneQueue.put(job.outputFolder)
         except Exception as exc:
-            print(f"[worker] failed job {jobDict.get('outputFolder', '?')}: {exc}")
+            print(f"[worker] failed job {jobDict.get('outputFolder', '?')}: {exc}", flush=True)
             doneQueue.put(("__error__", jobDict.get("outputFolder", "?"), str(exc), jobDict, apiKey.strip()))
             break
 
@@ -492,7 +495,7 @@ def runDynamicTierPool(
             print(
                 f"[scheduler] failed {failedLabel} (running: {sorted(inFlight)}) "
                 f"-> key retired ({failedKey}), job requeued"
-            )
+            , flush=True)
             tryDispatch()
             continue
         inFlight.discard(folder)
@@ -507,13 +510,13 @@ def runDynamicTierPool(
             proc.terminate()
 
     if failedJobs:
-        print("\nCompleted with failed jobs:")
+        print("\nCompleted with failed jobs:", flush=True)
         for row in failedJobs:
-            print(f"  - {row}")
+            print(f"  - {row}", flush=True)
     if retiredKeys:
-        print("\nRetired API keys:")
+        print("\nRetired API keys:", flush=True)
         for key in retiredKeys:
-            print(f"  - {key}")
+            print(f"  - {key}", flush=True)
 
 
 def main() -> None:
@@ -525,15 +528,15 @@ def main() -> None:
     args = parser.parse_args()
 
     apiKeys = readRiotAPIKeys()
-    print(f"Loaded {len(apiKeys)} API key(s) from {apiKeyPath}")
+    print(f"Loaded {len(apiKeys)} API key(s) from {apiKeyPath}", flush=True)
 
     runDir = buildRunDir(args.region, args.queue)
-    print(f"Run directory: {runDir}")
+    print(f"Run directory: {runDir}", flush=True)
     outNames = [jobJsonlPath(runDir, buildJobAtIndex(i)).name for i in range(numTierJobs)]
-    print(f"Output files under {runDir}: {' → '.join(outNames)}")
+    print(f"Output files under {runDir}: {' → '.join(outNames)}", flush=True)
 
     runDynamicTierPool(apiKeys, runDir, args.region, args.queue)
-    print("\nDone.")
+    print("\nDone.", flush=True)
 
 
 if __name__ == "__main__":

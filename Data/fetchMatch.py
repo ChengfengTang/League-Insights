@@ -4,8 +4,8 @@ Fetch match metadata and timelines for players listed in a fetchPlayer run folde
 Put one or more API keys in Data/riotApiKey.txt (one per line; # starts a comment).
 
 Example:
-  python Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-235836
-  python Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-235836 --count 50
+  python3 Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-235836
+  python3 Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-235836 --count 50
 
 Expects that folder to contain one or more *.jsonl files (e.g. challenger-grandmaster.jsonl,
 master.jsonl, diamondI.jsonl …). Each file is one job. With multiple keys, one worker process
@@ -47,8 +47,8 @@ TARGET_MAP_ID = 11     # Summoner's Rift
 
 workerShutdown = None
 PROGRESS_BAR_WIDTH = 30
-PROGRESS_PRINT_EVERY_COUNT = 50
-PROGRESS_PRINT_EVERY_SECONDS = 2.0
+PROGRESS_PRINT_EVERY_COUNT = 100
+PROGRESS_PRINT_EVERY_SECONDS = 10.0
 
 
 def readRiotAPIKeys() -> List[str]:
@@ -92,7 +92,7 @@ def riotGet(url: str, headers: Dict[str, str], maxRetries: int = 12) -> requests
                 raise
             attempt += 1
             delay = min(2.0 ** min(attempt, 7), 120.0)
-            print(f"[http] request error ({exc}); retrying in {delay:.1f}s")
+            print(f"[http] request error ({exc}); retrying in {delay:.1f}s", flush=True)
             time.sleep(delay)
             continue
 
@@ -236,24 +236,20 @@ def matchAlreadyStoredOrProcessed(
     Checks:
       - Data/matches/<run>/<division>/<matchId>.json
       - Data/timelines/<run>/<division>/<matchId>_timeline.json
-      - Data/log/<run>/<division>/<matchId>_timeline.json   (legacy naming pattern)
-      - Data/log/<run>/<division>/<matchId>/parsedData.json (current processMatch output)
+      - Data/log/<run>/<division>/<matchId>.jsonl (current processMatch output)
+      - Data/log/<run>/<division>/<matchId>/parsedData.json (legacy processMatch output)
     """
     matchPath = dataDirPath / "matches" / runName / divisionLabel / f"{matchId}.json"
     timelinePath = (
         dataDirPath / "timelines" / runName / divisionLabel / f"{matchId}_timeline.json"
     )
-    legacyLogTimelinePath = (
-        dataDirPath / "log" / runName / divisionLabel / f"{matchId}_timeline.json"
-    )
-    processedLogPath = (
-        dataDirPath / "log" / runName / divisionLabel / matchId / "parsedData.json"
-    )
+    processedLogPath = dataDirPath / "log" / runName / divisionLabel / f"{matchId}.jsonl"
+    legacyProcessedLogPath = dataDirPath / "log" / runName / divisionLabel / matchId / "parsedData.json"
     return (
         matchPath.exists()
         or timelinePath.exists()
-        or legacyLogTimelinePath.exists()
         or processedLogPath.exists()
+        or legacyProcessedLogPath.exists()
     )
 
 
@@ -270,7 +266,7 @@ def fetchAndSaveMatchFiles(
     if matchPath.exists():
         matchData = readJson(matchPath)
         if matchData is None:
-            print(f"Invalid metadata JSON for {matchId}, refetching")
+            print(f"Invalid metadata JSON for {matchId}, refetching", flush=True)
     if matchData is None:
         matchUrl = f"https://{matchCluster}.api.riotgames.com/lol/match/v5/matches/{matchId}"
         response = riotGet(matchUrl, headers=getRiotHeaders())
@@ -278,7 +274,7 @@ def fetchAndSaveMatchFiles(
             matchData = response.json()
             saveJson(matchPath, matchData)
         else:
-            print(f"Failed metadata for {matchId}: {response.status_code}")
+            print(f"Failed metadata for {matchId}: {response.status_code}", flush=True)
             return
 
     if not isEligibleMatchMetadata(matchData):
@@ -287,7 +283,7 @@ def fetchAndSaveMatchFiles(
         print(
             f"Skipping {matchId}: expected queue {TARGET_QUEUE_ID} on map {TARGET_MAP_ID}, "
             f"got queue {queueId}, map {mapId}"
-        )
+        , flush=True)
         return
 
     if not timelinePath.exists():
@@ -299,7 +295,7 @@ def fetchAndSaveMatchFiles(
         if response.status_code == 200:
             saveJson(timelinePath, response.json())
         else:
-            print(f"Failed timeline for {matchId}: {response.status_code}")
+            print(f"Failed timeline for {matchId}: {response.status_code}", flush=True)
 
 
 def runJsonlJob(task: Dict) -> None:
@@ -318,7 +314,7 @@ def runJsonlJob(task: Dict) -> None:
 
     players = loadPlayersFromJsonl(jsonlPath)
     totalPlayers = len(players)
-    print(f"[{divisionLabel}] {formatProgressBar(0, max(1, totalPlayers))}")
+    print(f"[{divisionLabel}] {formatProgressBar(0, max(1, totalPlayers))}", flush=True)
 
     seenRiotIds: Set[str] = set()
     seenMatchIds: Set[str] = set()
@@ -330,7 +326,7 @@ def runJsonlJob(task: Dict) -> None:
         tag = player.get("tag", "unknown")
         riotIdKey = f"{str(username).strip().lower()}#{str(tag).strip().lower()}"
         if not username or not tag:
-            print(f"[{divisionLabel}] Skipping entry with missing username/tag")
+            print(f"[{divisionLabel}] Skipping entry with missing username/tag", flush=True)
             continue
         if riotIdKey in seenRiotIds:
             continue
@@ -339,13 +335,13 @@ def runJsonlJob(task: Dict) -> None:
         try:
             puuid = fetchPuuidFromRiotId(matchCluster, username, tag)
         except Exception as error:
-            print(f"[{divisionLabel}] Failed Riot ID lookup for {username}#{tag}: {error}")
+            print(f"[{divisionLabel}] Failed Riot ID lookup for {username}#{tag}: {error}", flush=True)
             continue
 
         try:
             matchIds = fetchMatchIds(matchCluster, puuid, matchCount)
         except Exception as error:
-            print(f"[{divisionLabel}] Failed match list for {username}#{tag}: {error}")
+            print(f"[{divisionLabel}] Failed match list for {username}#{tag}: {error}", flush=True)
         else:
             for matchId in matchIds:
                 if matchId in seenMatchIds:
@@ -366,10 +362,12 @@ def runJsonlJob(task: Dict) -> None:
                 or now - lastProgressTime >= PROGRESS_PRINT_EVERY_SECONDS
             )
             if shouldPrint:
-                print(f"[{divisionLabel}] {formatProgressBar(processedPlayers, totalPlayers)}")
+                print(
+                    f"[{divisionLabel}] {formatProgressBar(processedPlayers, totalPlayers)}",
+                    flush=True,
+                )
                 lastProgressCount = processedPlayers
                 lastProgressTime = now
-
 
 def matchFileWorkerLoop(
     apiKey: str,
@@ -387,7 +385,7 @@ def matchFileWorkerLoop(
             doneQueue.put(task["divisionLabel"])
         except Exception as exc:
             label = task.get("divisionLabel", "?") if isinstance(task, dict) else "?"
-            print(f"[worker] failed job {label}: {exc}")
+            print(f"[worker] failed job {label}: {exc}", flush=True)
             doneQueue.put(("__error__", label, str(exc), task, apiKey.strip()))
             break
 
@@ -480,7 +478,7 @@ def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
             print(
                 f"[scheduler] failed {failedLabel} (running: {sorted(inFlight)}) "
                 f"-> key retired ({failedKey}), job requeued"
-            )
+            , flush=True)
             tryDispatch()
             continue
         inFlight.discard(finished)
@@ -493,13 +491,13 @@ def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
             proc.terminate()
 
     if failedJobs:
-        print("\nCompleted with failed jobs:")
+        print("\nCompleted with failed jobs:", flush=True)
         for row in failedJobs:
-            print(f"  - {row}")
+            print(f"  - {row}", flush=True)
     if retiredKeys:
-        print("\nRetired API keys:")
+        print("\nRetired API keys:", flush=True)
         for key in retiredKeys:
-            print(f"  - {key}")
+            print(f"  - {key}", flush=True)
 
 
 def main() -> None:
@@ -520,20 +518,20 @@ def main() -> None:
     args = parser.parse_args()
 
     apiKeys = readRiotAPIKeys()
-    print(f"Loaded {len(apiKeys)} API key(s) from {apiKeyPath}")
+    print(f"Loaded {len(apiKeys)} API key(s) from {apiKeyPath}", flush=True)
 
     playersFolder = resolvePlayersFolder(args.playersFolder)
     runName = playersFolder.name
     platformRegion = platformRegionFromRunName(runName)
     matchCluster = matchClusterForPlatform(platformRegion)
     tasks = buildTasksForFolder(playersFolder, matchCluster, args.count)
-    print(f"Players folder: {playersFolder}")
-    print(f"Platform {platformRegion!r} -> match cluster {matchCluster!r}")
-    print(f"Jobs ({len(tasks)}): " + " → ".join(t["divisionLabel"] for t in tasks))
-    print(f"Output: {matchesDir / runName}/<division>/ and {timelinesDir / runName}/<division>/")
+    print(f"Players folder: {playersFolder}", flush=True)
+    print(f"Platform {platformRegion!r} -> match cluster {matchCluster!r}", flush=True)
+    print(f"Jobs ({len(tasks)}): " + " → ".join(t["divisionLabel"] for t in tasks), flush=True)
+    print(f"Output: {matchesDir / runName}/<division>/ and {timelinesDir / runName}/<division>/", flush=True)
 
     runDynamicMatchPool(apiKeys, tasks)
-    print("\nDone.")
+    print("\nDone.", flush=True)
 
 
 if __name__ == "__main__":
