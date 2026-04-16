@@ -30,6 +30,7 @@ import json
 import multiprocessing
 import os
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
@@ -45,6 +46,9 @@ TARGET_QUEUE_ID = 420  # Ranked Solo/Duo
 TARGET_MAP_ID = 11     # Summoner's Rift
 
 workerShutdown = None
+PROGRESS_BAR_WIDTH = 30
+PROGRESS_PRINT_EVERY_COUNT = 50
+PROGRESS_PRINT_EVERY_SECONDS = 2.0
 
 
 def readRiotAPIKeys() -> List[str]:
@@ -81,7 +85,17 @@ def parseRetryAfterSeconds(response: requests.Response) -> Optional[float]:
 def riotGet(url: str, headers: Dict[str, str], maxRetries: int = 12) -> requests.Response:
     attempt = 0
     while True:
-        response = requests.get(url, headers=headers, timeout=60)
+        try:
+            response = requests.get(url, headers=headers, timeout=60)
+        except requests.exceptions.RequestException as exc:
+            if attempt >= maxRetries:
+                raise
+            attempt += 1
+            delay = min(2.0 ** min(attempt, 7), 120.0)
+            print(f"[http] request error ({exc}); retrying in {delay:.1f}s")
+            time.sleep(delay)
+            continue
+
         if response.status_code == 429 and attempt < maxRetries:
             attempt += 1
             delay = parseRetryAfterSeconds(response)
@@ -90,6 +104,14 @@ def riotGet(url: str, headers: Dict[str, str], maxRetries: int = 12) -> requests
             time.sleep(delay)
             continue
         return response
+
+
+def formatProgressBar(current: int, total: int, width: int = PROGRESS_BAR_WIDTH) -> str:
+    if total <= 0:
+        total = 1
+    ratio = max(0.0, min(1.0, current / total))
+    done = int(ratio * width)
+    return f"[{'#' * done}{'-' * (width - done)}] {ratio * 100:5.1f}% ({current}/{total})"
 
 
 def resolvePlayersFolder(arg: str) -> Path:
@@ -202,6 +224,39 @@ def isEligibleMatchMetadata(matchData: Dict[str, Any]) -> bool:
     return info.get("queueId") == TARGET_QUEUE_ID and info.get("mapId") == TARGET_MAP_ID
 
 
+def matchAlreadyStoredOrProcessed(
+    dataDirPath: Path,
+    runName: str,
+    divisionLabel: str,
+    matchId: str,
+) -> bool:
+    """
+    Duplicate detector across raw + processed outputs.
+
+    Checks:
+      - Data/matches/<run>/<division>/<matchId>.json
+      - Data/timelines/<run>/<division>/<matchId>_timeline.json
+      - Data/log/<run>/<division>/<matchId>_timeline.json   (legacy naming pattern)
+      - Data/log/<run>/<division>/<matchId>/parsedData.json (current processMatch output)
+    """
+    matchPath = dataDirPath / "matches" / runName / divisionLabel / f"{matchId}.json"
+    timelinePath = (
+        dataDirPath / "timelines" / runName / divisionLabel / f"{matchId}_timeline.json"
+    )
+    legacyLogTimelinePath = (
+        dataDirPath / "log" / runName / divisionLabel / f"{matchId}_timeline.json"
+    )
+    processedLogPath = (
+        dataDirPath / "log" / runName / divisionLabel / matchId / "parsedData.json"
+    )
+    return (
+        matchPath.exists()
+        or timelinePath.exists()
+        or legacyLogTimelinePath.exists()
+        or processedLogPath.exists()
+    )
+
+
 def fetchAndSaveMatchFiles(
     matchCluster: str,
     matchId: str,
@@ -222,12 +277,9 @@ def fetchAndSaveMatchFiles(
         if response.status_code == 200:
             matchData = response.json()
             saveJson(matchPath, matchData)
-            print(f"Saved metadata for {matchId}")
         else:
             print(f"Failed metadata for {matchId}: {response.status_code}")
             return
-    else:
-        print(f"Metadata exists for {matchId}, skipping")
 
     if not isEligibleMatchMetadata(matchData):
         queueId = matchData.get("info", {}).get("queueId")
@@ -246,11 +298,8 @@ def fetchAndSaveMatchFiles(
         response = riotGet(timelineUrl, headers=getRiotHeaders())
         if response.status_code == 200:
             saveJson(timelinePath, response.json())
-            print(f"Saved timeline for {matchId}")
         else:
             print(f"Failed timeline for {matchId}: {response.status_code}")
-    else:
-        print(f"Timeline exists for {matchId}, skipping")
 
 
 def runJsonlJob(task: Dict) -> None:
@@ -268,10 +317,14 @@ def runJsonlJob(task: Dict) -> None:
     timelinesDivisionDir.mkdir(parents=True, exist_ok=True)
 
     players = loadPlayersFromJsonl(jsonlPath)
-    print(f"[{divisionLabel}] Loaded {len(players)} players from {jsonlPath.name}")
+    totalPlayers = len(players)
+    print(f"[{divisionLabel}] {formatProgressBar(0, max(1, totalPlayers))}")
 
     seenRiotIds: Set[str] = set()
     seenMatchIds: Set[str] = set()
+    processedPlayers = 0
+    lastProgressCount = -1
+    lastProgressTime = 0.0
     for player in players:
         username = player.get("username", "unknown")
         tag = player.get("tag", "unknown")
@@ -291,18 +344,31 @@ def runJsonlJob(task: Dict) -> None:
 
         try:
             matchIds = fetchMatchIds(matchCluster, puuid, matchCount)
-            print(f"[{divisionLabel}] {len(matchIds)} match IDs for {username}#{tag}")
         except Exception as error:
             print(f"[{divisionLabel}] Failed match list for {username}#{tag}: {error}")
-            continue
-
-        for matchId in matchIds:
-            if matchId in seenMatchIds:
-                continue
-            seenMatchIds.add(matchId)
-            fetchAndSaveMatchFiles(
-                matchCluster, matchId, matchesDivisionDir, timelinesDivisionDir
+        else:
+            for matchId in matchIds:
+                if matchId in seenMatchIds:
+                    continue
+                if matchAlreadyStoredOrProcessed(dataDirPath, runName, divisionLabel, matchId):
+                    seenMatchIds.add(matchId)
+                    continue
+                seenMatchIds.add(matchId)
+                fetchAndSaveMatchFiles(
+                    matchCluster, matchId, matchesDivisionDir, timelinesDivisionDir
+                )
+        finally:
+            processedPlayers += 1
+            now = time.time()
+            shouldPrint = (
+                processedPlayers == totalPlayers
+                or processedPlayers - lastProgressCount >= PROGRESS_PRINT_EVERY_COUNT
+                or now - lastProgressTime >= PROGRESS_PRINT_EVERY_SECONDS
             )
+            if shouldPrint:
+                print(f"[{divisionLabel}] {formatProgressBar(processedPlayers, totalPlayers)}")
+                lastProgressCount = processedPlayers
+                lastProgressTime = now
 
 
 def matchFileWorkerLoop(
@@ -322,7 +388,8 @@ def matchFileWorkerLoop(
         except Exception as exc:
             label = task.get("divisionLabel", "?") if isinstance(task, dict) else "?"
             print(f"[worker] failed job {label}: {exc}")
-            doneQueue.put(("__error__", str(exc)))
+            doneQueue.put(("__error__", label, str(exc), task, apiKey.strip()))
+            break
 
 
 def buildTasksForFolder(
@@ -352,7 +419,6 @@ def buildTasksForFolder(
 
 
 def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
-    numJobs = len(tasks)
     numWorkers = len(apiKeys)
 
     if numWorkers == 1:
@@ -375,45 +441,65 @@ def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
         workers.append(proc)
 
     inFlight: Set[str] = set()
-    nextJobIndex = 0
+    pendingTasks = deque(tasks)
+    activeWorkers = numWorkers
+    failedJobs: List[str] = []
+    retiredKeys: List[str] = []
 
     def tryDispatch() -> None:
-        nonlocal nextJobIndex
-        while len(inFlight) < numWorkers and nextJobIndex < numJobs:
-            task = tasks[nextJobIndex]
-            nextJobIndex += 1
+        while len(inFlight) < activeWorkers and pendingTasks:
+            task = pendingTasks.popleft()
             taskQueue.put(task)
             inFlight.add(task["divisionLabel"])
-            print(
-                f"[scheduler] dispatched {task['divisionLabel']} "
-                f"(running: {sorted(inFlight)})"
-            )
 
     tryDispatch()
 
-    while inFlight or nextJobIndex < numJobs:
+    while inFlight or pendingTasks:
         if not inFlight:
-            if nextJobIndex >= numJobs:
+            if not pendingTasks:
                 break
+            if activeWorkers <= 0:
+                raise RuntimeError(
+                    "All API keys failed; no workers left to continue pending jobs."
+                )
             tryDispatch()
             if not inFlight:
                 continue
 
         finished = doneQueue.get()
         if isinstance(finished, tuple) and finished[0] == "__error__":
-            for _ in workers:
-                taskQueue.put(workerShutdown)
-            raise RuntimeError(finished[1])
+            failedLabel = finished[1]
+            failedError = finished[2]
+            failedTask = finished[3]
+            failedKey = finished[4]
+            inFlight.discard(failedLabel)
+            failedJobs.append(f"{failedLabel}: {failedError}")
+            pendingTasks.append(failedTask)
+            retiredKeys.append(failedKey)
+            activeWorkers = max(0, activeWorkers - 1)
+            print(
+                f"[scheduler] failed {failedLabel} (running: {sorted(inFlight)}) "
+                f"-> key retired ({failedKey}), job requeued"
+            )
+            tryDispatch()
+            continue
         inFlight.discard(finished)
-        print(f"[scheduler] finished {finished} (running: {sorted(inFlight)})")
         tryDispatch()
-
     for _ in workers:
         taskQueue.put(workerShutdown)
     for proc in workers:
         proc.join(timeout=600)
         if proc.is_alive():
             proc.terminate()
+
+    if failedJobs:
+        print("\nCompleted with failed jobs:")
+        for row in failedJobs:
+            print(f"  - {row}")
+    if retiredKeys:
+        print("\nRetired API keys:")
+        for key in retiredKeys:
+            print(f"  - {key}")
 
 
 def main() -> None:

@@ -26,6 +26,7 @@ import json
 import multiprocessing
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +53,9 @@ tierJobsSpec: List[Tuple[str, str, str, str]] = [
 numTierJobs = len(tierJobsSpec)
 
 workerShutdown = None  # task-queue sentinel so child processes exit their loops.
+PROGRESS_BAR_WIDTH = 30
+PROGRESS_PRINT_EVERY_COUNT = 50
+PROGRESS_PRINT_EVERY_SECONDS = 2.0
 
 
 @dataclass
@@ -131,6 +135,14 @@ def riotGet(url: str, headers: Dict[str, str], maxRetries: int = 12) -> requests
         return response
 
 
+def formatProgressBar(current: int, total: int, width: int = PROGRESS_BAR_WIDTH) -> str:
+    if total <= 0:
+        total = 1
+    ratio = max(0.0, min(1.0, current / total))
+    done = int(ratio * width)
+    return f"[{'#' * done}{'-' * (width - done)}] {ratio * 100:5.1f}% ({current}/{total})"
+
+
 def fetchApexTierPlayers(region: str, tier: str, queue: str) -> List[Dict]:
     """
     One apex league snapshot: challenger, grandmaster, or master.
@@ -194,10 +206,6 @@ def fetchDiamondDivisionPages(
             break
         entries.sort(key=lambda entry: entry.get("leaguePoints", 0), reverse=True)
         allEntries.extend(entries)
-        print(
-            f"[{logPrefix}] League fetch {tier} div {division} page {page}: "
-            f"+{len(entries)} rows (total {len(allEntries)})"
-        )
         page += 1
     return allEntries
 
@@ -290,6 +298,10 @@ def resolveAndWriteEntries(
     """
     outPath.parent.mkdir(parents=True, exist_ok=True)
     seenPuuids: Set[str] = set()
+    totalEntries = len(entries)
+    processedEntries = 0
+    lastProgressCount = -1
+    lastProgressTime = 0.0
     with outPath.open("w", encoding="utf-8") as outFile:
         for entry in entries:
             try:
@@ -314,11 +326,6 @@ def resolveAndWriteEntries(
                 }
                 outFile.write(json.dumps(playerRow, ensure_ascii=False) + "\n")
                 seenPuuids.add(puuid)
-
-                print(
-                    f"[{workerLabel}] {riotId['gameName']}#{riotId['tagLine']} "
-                    f"(tier={entry.get('sourceTier', 'unknown')})"
-                )
             except Exception as error:
                 summonerLabel = (
                     entry.get("summonerName")
@@ -328,6 +335,18 @@ def resolveAndWriteEntries(
                 )
                 print(f"[{workerLabel}] Error processing {summonerLabel}: {error}")
                 continue
+            finally:
+                processedEntries += 1
+                now = time.time()
+                shouldPrint = (
+                    processedEntries == totalEntries
+                    or processedEntries - lastProgressCount >= PROGRESS_PRINT_EVERY_COUNT
+                    or now - lastProgressTime >= PROGRESS_PRINT_EVERY_SECONDS
+                )
+                if shouldPrint:
+                    print(f"[{workerLabel}] {formatProgressBar(processedEntries, totalEntries)}")
+                    lastProgressCount = processedEntries
+                    lastProgressTime = now
 
 
 def materializeTierEntries(job: TierJob, region: str, queue: str) -> List[Dict]:
@@ -350,10 +369,9 @@ def materializeTierEntries(job: TierJob, region: str, queue: str) -> List[Dict]:
 
 def runTierJob(job: TierJob, region: str, queue: str, runDir: Path) -> None:
     """Fetch one league slice and write resolved rows to a flat file under runDir."""
-    print(f"[{job.outputFolder}] Fetching league entries...")
     entries = materializeTierEntries(job, region, queue)
     outPath = jobJsonlPath(runDir, job)
-    print(f"[{job.outputFolder}] Resolving {len(entries)} entries -> {outPath}")
+    print(f"[{job.outputFolder}] {formatProgressBar(0, max(1, len(entries)))}")
     resolveAndWriteEntries(entries, region, outPath, job.outputFolder)
 
 
@@ -377,7 +395,8 @@ def tierWorkerLoop(apiKey: str, taskQueue: "multiprocessing.Queue", doneQueue: "
             doneQueue.put(job.outputFolder)
         except Exception as exc:
             print(f"[worker] failed job {jobDict.get('outputFolder', '?')}: {exc}")
-            doneQueue.put(("__error__", str(exc)))
+            doneQueue.put(("__error__", jobDict.get("outputFolder", "?"), str(exc), jobDict, apiKey.strip()))
+            break
 
 
 def buildJobAtIndex(jobIndex: int) -> TierJob:
@@ -433,38 +452,50 @@ def runDynamicTierPool(
         workers.append(proc)
 
     inFlight: Set[str] = set()  # job labels still running on a worker
-    nextJobIndex = 0  # next slot in tierJobsSpec to hand out
+    pendingJobs = deque(buildJobAtIndex(i) for i in range(numTierJobs))
+    activeWorkers = numWorkers
+    failedJobs: List[str] = []
+    retiredKeys: List[str] = []
 
     def tryDispatch() -> None:
         """Start as many pending jobs as we have idle workers and remaining work."""
-        nonlocal nextJobIndex
-        while len(inFlight) < numWorkers and nextJobIndex < numTierJobs:
-            job = buildJobAtIndex(nextJobIndex)
-            nextJobIndex += 1
+        while len(inFlight) < activeWorkers and pendingJobs:
+            job = pendingJobs.popleft()
             taskQueue.put((dataclasses.asdict(job), runDirResolved, region, queue))
             inFlight.add(job.outputFolder)
-            print(
-                f"[scheduler] dispatched {job.outputFolder} "
-                f"(running: {sorted(inFlight)})"
-            )
 
     tryDispatch()
 
-    while inFlight or nextJobIndex < numTierJobs:
+    while inFlight or pendingJobs:
         if not inFlight:
-            if nextJobIndex >= numTierJobs:
+            if not pendingJobs:
                 break
+            if activeWorkers <= 0:
+                raise RuntimeError(
+                    "All API keys failed; no workers left to continue pending tier jobs."
+                )
             tryDispatch()
             if not inFlight:
                 continue
 
         folder = doneQueue.get()
         if isinstance(folder, tuple) and folder[0] == "__error__":
-            for _ in workers:
-                taskQueue.put(workerShutdown)
-            raise RuntimeError(folder[1])
+            failedLabel = folder[1]
+            failedError = folder[2]
+            failedJobDict = folder[3]
+            failedKey = folder[4]
+            inFlight.discard(failedLabel)
+            pendingJobs.append(TierJob(**failedJobDict))
+            failedJobs.append(f"{failedLabel}: {failedError}")
+            retiredKeys.append(failedKey)
+            activeWorkers = max(0, activeWorkers - 1)
+            print(
+                f"[scheduler] failed {failedLabel} (running: {sorted(inFlight)}) "
+                f"-> key retired ({failedKey}), job requeued"
+            )
+            tryDispatch()
+            continue
         inFlight.discard(folder)
-        print(f"[scheduler] finished {folder} (running: {sorted(inFlight)})")
 
         tryDispatch()
 
@@ -474,6 +505,15 @@ def runDynamicTierPool(
         proc.join(timeout=600)
         if proc.is_alive():
             proc.terminate()
+
+    if failedJobs:
+        print("\nCompleted with failed jobs:")
+        for row in failedJobs:
+            print(f"  - {row}")
+    if retiredKeys:
+        print("\nRetired API keys:")
+        for key in retiredKeys:
+            print(f"  - {key}")
 
 
 def main() -> None:
