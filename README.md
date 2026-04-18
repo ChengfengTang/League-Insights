@@ -13,8 +13,8 @@ Scripts live under `Data/` and are intended to be run from the **repository root
 | Script | Role |
 |--------|------|
 | **`Data/fetchPlayer.py`** | Downloads ranked players from **Challenger through Diamond IV** for the given `--region` and `--queue`. Writes `Data/players/<region>-<queue>-<timestamp>/` with flat JSONL files (`challenger-grandmaster.jsonl`, `master.jsonl`, `diamondI.jsonl` through `diamondIV.jsonl`). Each line contains `username`, `tag`, `puuid`, and `sourceTier`. Uses **multiprocessing**: one worker process per API key, with a queue of tier jobs. |
-| **`Data/fetchMatch.py`** | **`--playersFolder`** must point at a player run directory (for example `players/na1-ranked-solo-5x5-20260413-235836`). Each `*.jsonl` file in that folder is one job. Writes `Data/matches/<run>/<division>/` and `Data/timelines/<run>/<division>/`. The Match v5 **routing cluster** (`americas`, `europe`, or `asia`) is inferred from the **first segment** of the folder name (for example `na1` in `na1-...`). Optional **`--count`** (default 100) limits how many match IDs are requested per player. |
-| **`Data/processMatch.py`** | **Offline only.** Takes a single **positional argument**, the run name (for example `na1-ranked-solo-5x5-20260413-235836`). Reads `Data/matches/<runName>/` and pairs each division subfolder with `Data/timelines/<runName>/<division>/`. Uses up to **`min(CPU count, number of division jobs)`** worker processes. Writes one ML-ready file per match at `Data/log/<run>/<division>/<matchId>.jsonl`. |
+| **`Data/fetchMatch.py`** | **`--playersFolder`** must point at a player run directory (for example `players/na1-ranked-solo-5x5-20260413-235836`). Loads every `*.jsonl` there, **merges unique players** (by Riot ID), and splits them across **one worker per API key**. Writes flat `Data/matches/<run>/` and `Data/timelines/<run>/`. The Match v5 **routing cluster** (`americas`, `europe`, or `asia`) is inferred from the **first segment** of the folder name (for example `na1` in `na1-...`). Optional **`--count`** (default 100) limits how many match IDs are requested per player. |
+| **`Data/processMatch.py`** | **Offline only.** Takes a single **positional argument**, the run name (for example `na1-ranked-solo-5x5-20260413-235836`). Reads flat `Data/matches/<runName>/*.json` with `Data/timelines/<runName>/`. Splits match files across up to **`CPU count`** worker processes. Writes `Data/log/<runName>/<matchId>.jsonl`. |
 
 **Typical flow:** run `fetchPlayer`, then `fetchMatch` using the same player run folder, then `processMatch` using the same directory name as under `matches/`. The `Data/` scripts require the **`requests`** library (`pip install requests`).
 
@@ -111,7 +111,7 @@ Downloads match metadata and timelines for every player listed in the JSONL file
 | `--playersFolder` | **Yes** | (none) | Folder produced by `fetchPlayer`. Typical values: `players/<run-folder-name>` from the repo root, **or** just `<run-folder-name>` (the script looks under `Data/players/`), **or** an absolute path to the run folder. |
 | `--count` | No | `100` | Maximum match IDs to request **per player**. |
 
-The player run folder must contain at least one `*.jsonl` file **in that folder itself** (not only inside subfolders). Each file’s name (without `.jsonl`) becomes a **division** label in `matches/` and `timelines/`.
+The player run folder must contain at least one `*.jsonl` file **in that folder itself** (not only inside subfolders). All files are read; players are merged (duplicate Riot IDs dropped) then sharded across your API keys.
 
 **Examples:**
 
@@ -120,7 +120,7 @@ python Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-2
 python Data/fetchMatch.py --playersFolder na1-ranked-solo-5x5-20260413-235836 --count 50
 ```
 
-**Output:** `Data/matches/<run>/<division>/` and `Data/timelines/<run>/<division>/`. The `<run>` folder name matches the player run basename.
+**Output:** `Data/matches/<run>/` and `Data/timelines/<run>/` (flat; no tier subfolders). The `<run>` folder name matches the player run basename.
 
 ### processMatch.py
 
@@ -136,7 +136,7 @@ Reads local match and timeline JSON only (no Riot traffic, no API key file neede
 python Data/processMatch.py na1-ranked-solo-5x5-20260413-235836
 ```
 
-**Output:** `Data/log/<runName>/<division>/<matchId>.jsonl`. Each file contains one parsed match object with three sections:
+**Output:** `Data/log/<runName>/<matchId>.jsonl`. Each file contains one parsed match object with three sections:
 
 - `matchContext`: static match-level metadata that does not change over time, including `matchId`, patch, queue/map, both teams, all participants, and the identified blue/red junglers.
 - `junglerTrainingRows`: one row per jungler per frame with only online-safe movement features, including position, short motion history, level/xp/gold/CS/HP state, recent nearby pressure from events, and next-frame targets used for supervised training.
@@ -178,8 +178,8 @@ python Data/processMatch.py na1-ranked-solo-5x5-20260413-235836
 ### Data pipeline (`Data/`)
 
 - Ranked ladder coverage from Challenger through Diamond IV, with optional multi-key parallelism in `fetchPlayer`.
-- Bulk match and timeline files under `matches/<run>/<division>/` and `timelines/<run>/<division>/` from `fetchMatch`, with routing derived from the run folder prefix.
-- `processMatch` builds `log/<run>/<division>/<matchId>.jsonl` from local files only, parallelized by CPU count.
+- Bulk match and timeline files under flat `matches/<run>/` and `timelines/<run>/` from `fetchMatch`, with routing derived from the run folder prefix.
+- `processMatch` builds `log/<run>/<matchId>.jsonl` from local files only, parallelized by CPU count.
 
 ### Data processing (Predict)
 

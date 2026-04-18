@@ -8,12 +8,12 @@ Example:
   python3 Data/fetchMatch.py --playersFolder players/na1-ranked-solo-5x5-20260413-235836 --count 50
 
 Expects that folder to contain one or more *.jsonl files (e.g. challenger-grandmaster.jsonl,
-master.jsonl, diamondI.jsonl …). Each file is one job. With multiple keys, one worker process
-per key runs jobs from a queue (same scheduling idea as fetchPlayer).
+master.jsonl, diamondI.jsonl …). All players are merged and split evenly across workers (one
+worker per API key). Match files are written flat under the run folder (no division subfolders).
 
 Writes:
-  Data/matches/<run-folder-name>/<division-stem>/<matchId>.json
-  Data/timelines/<run-folder-name>/<division-stem>/<matchId>_timeline.json
+  Data/matches/<run-folder-name>/<matchId>.json
+  Data/timelines/<run-folder-name>/<matchId>_timeline.json
 
 CLI: --playersFolder (required; run folder name starts with the platform shard, e.g. na1-...).
       --count optional; max match IDs to request per player (default 100).
@@ -224,43 +224,35 @@ def isEligibleMatchMetadata(matchData: Dict[str, Any]) -> bool:
     return info.get("queueId") == TARGET_QUEUE_ID and info.get("mapId") == TARGET_MAP_ID
 
 
-def matchAlreadyStoredOrProcessed(
-    dataDirPath: Path,
-    runName: str,
-    divisionLabel: str,
-    matchId: str,
-) -> bool:
+def matchAlreadyStoredOrProcessed(dataDirPath: Path, runName: str, matchId: str) -> bool:
     """
-    Duplicate detector across raw + processed outputs.
+    Duplicate detector across raw + processed outputs for this run (flat layout).
 
     Checks:
-      - Data/matches/<run>/<division>/<matchId>.json
-      - Data/timelines/<run>/<division>/<matchId>_timeline.json
-      - Data/log/<run>/<division>/<matchId>.jsonl (current processMatch output)
-      - Data/log/<run>/<division>/<matchId>/parsedData.json (legacy processMatch output)
+      - Data/matches/<run>/<matchId>.json
+      - Data/timelines/<run>/<matchId>_timeline.json
+      - Data/log/<run>/<matchId>.jsonl
     """
-    matchPath = dataDirPath / "matches" / runName / divisionLabel / f"{matchId}.json"
-    timelinePath = (
-        dataDirPath / "timelines" / runName / divisionLabel / f"{matchId}_timeline.json"
-    )
-    processedLogPath = dataDirPath / "log" / runName / divisionLabel / f"{matchId}.jsonl"
-    legacyProcessedLogPath = dataDirPath / "log" / runName / divisionLabel / matchId / "parsedData.json"
+    matchPath = dataDirPath / "matches" / runName / f"{matchId}.json"
+    timelinePath = dataDirPath / "timelines" / runName / f"{matchId}_timeline.json"
+    processedLogPath = dataDirPath / "log" / runName / f"{matchId}.jsonl"
     return (
         matchPath.exists()
         or timelinePath.exists()
         or processedLogPath.exists()
-        or legacyProcessedLogPath.exists()
     )
 
 
 def fetchAndSaveMatchFiles(
     matchCluster: str,
     matchId: str,
-    matchesDivisionDir: Path,
-    timelinesDivisionDir: Path,
+    matchesRunDir: Path,
+    timelinesRunDir: Path,
 ) -> None:
-    timelinePath = timelinesDivisionDir / f"{matchId}_timeline.json"
-    matchPath = matchesDivisionDir / f"{matchId}.json"
+    matchesRunDir.mkdir(parents=True, exist_ok=True)
+    timelinesRunDir.mkdir(parents=True, exist_ok=True)
+    timelinePath = timelinesRunDir / f"{matchId}_timeline.json"
+    matchPath = matchesRunDir / f"{matchId}.json"
 
     matchData: Optional[Dict[str, Any]] = None
     if matchPath.exists():
@@ -278,12 +270,6 @@ def fetchAndSaveMatchFiles(
             return
 
     if not isEligibleMatchMetadata(matchData):
-        queueId = matchData.get("info", {}).get("queueId")
-        mapId = matchData.get("info", {}).get("mapId")
-        print(
-            f"Skipping {matchId}: expected queue {TARGET_QUEUE_ID} on map {TARGET_MAP_ID}, "
-            f"got queue {queueId}, map {mapId}"
-        , flush=True)
         return
 
     if not timelinePath.exists():
@@ -298,23 +284,46 @@ def fetchAndSaveMatchFiles(
             print(f"Failed timeline for {matchId}: {response.status_code}", flush=True)
 
 
-def runJsonlJob(task: Dict) -> None:
-    """Process one division JSONL: list matches per player, save under run/division dirs."""
+def loadAllPlayersFromRunFolder(playersFolder: Path) -> List[Dict]:
+    """Load every *.jsonl in the run folder; dedupe by riotId (username#tag) case-insensitive."""
+    seenKeys: Set[str] = set()
+    merged: List[Dict] = []
+    for jsonlPath in sorted(playersFolder.glob("*.jsonl")):
+        for row in loadPlayersFromJsonl(jsonlPath):
+            username = row.get("username", "")
+            tag = row.get("tag", "")
+            riotIdKey = f"{str(username).strip().lower()}#{str(tag).strip().lower()}"
+            if riotIdKey in seenKeys:
+                continue
+            seenKeys.add(riotIdKey)
+            merged.append(row)
+    return merged
+
+
+def splitPlayersIntoShards(players: List[Dict], numShards: int) -> List[List[Dict]]:
+    if numShards <= 0:
+        return [players]
+    numShards = min(numShards, max(1, len(players)))
+    shards: List[List[Dict]] = [[] for _ in range(numShards)]
+    for index, player in enumerate(players):
+        shards[index % numShards].append(player)
+    return [s for s in shards if s]
+
+
+def runPlayerShardJob(task: Dict) -> None:
+    """Fetch match lists for a shard of players; write under matches/<run>/ and timelines/<run>/."""
     dataDirPath = Path(task["dataDirStr"])
     runName = task["runName"]
-    divisionLabel = task["divisionLabel"]
-    jsonlPath = Path(task["jsonlPath"])
+    shardLabel = task["shardLabel"]
+    players: List[Dict] = task["players"]
     matchCluster = task["matchCluster"]
     matchCount = int(task["matchCount"])
 
-    matchesDivisionDir = dataDirPath / "matches" / runName / divisionLabel
-    timelinesDivisionDir = dataDirPath / "timelines" / runName / divisionLabel
-    matchesDivisionDir.mkdir(parents=True, exist_ok=True)
-    timelinesDivisionDir.mkdir(parents=True, exist_ok=True)
+    matchesRunDir = dataDirPath / "matches" / runName
+    timelinesRunDir = dataDirPath / "timelines" / runName
 
-    players = loadPlayersFromJsonl(jsonlPath)
     totalPlayers = len(players)
-    print(f"[{divisionLabel}] {formatProgressBar(0, max(1, totalPlayers))}", flush=True)
+    print(f"[{shardLabel}] {formatProgressBar(0, max(1, totalPlayers))}", flush=True)
 
     seenRiotIds: Set[str] = set()
     seenMatchIds: Set[str] = set()
@@ -326,7 +335,7 @@ def runJsonlJob(task: Dict) -> None:
         tag = player.get("tag", "unknown")
         riotIdKey = f"{str(username).strip().lower()}#{str(tag).strip().lower()}"
         if not username or not tag:
-            print(f"[{divisionLabel}] Skipping entry with missing username/tag", flush=True)
+            print(f"[{shardLabel}] Skipping entry with missing username/tag", flush=True)
             continue
         if riotIdKey in seenRiotIds:
             continue
@@ -335,24 +344,22 @@ def runJsonlJob(task: Dict) -> None:
         try:
             puuid = fetchPuuidFromRiotId(matchCluster, username, tag)
         except Exception as error:
-            print(f"[{divisionLabel}] Failed Riot ID lookup for {username}#{tag}: {error}", flush=True)
+            print(f"[{shardLabel}] Failed Riot ID lookup for {username}#{tag}: {error}", flush=True)
             continue
 
         try:
             matchIds = fetchMatchIds(matchCluster, puuid, matchCount)
         except Exception as error:
-            print(f"[{divisionLabel}] Failed match list for {username}#{tag}: {error}", flush=True)
+            print(f"[{shardLabel}] Failed match list for {username}#{tag}: {error}", flush=True)
         else:
             for matchId in matchIds:
                 if matchId in seenMatchIds:
                     continue
-                if matchAlreadyStoredOrProcessed(dataDirPath, runName, divisionLabel, matchId):
+                if matchAlreadyStoredOrProcessed(dataDirPath, runName, matchId):
                     seenMatchIds.add(matchId)
                     continue
                 seenMatchIds.add(matchId)
-                fetchAndSaveMatchFiles(
-                    matchCluster, matchId, matchesDivisionDir, timelinesDivisionDir
-                )
+                fetchAndSaveMatchFiles(matchCluster, matchId, matchesRunDir, timelinesRunDir)
         finally:
             processedPlayers += 1
             now = time.time()
@@ -363,7 +370,7 @@ def runJsonlJob(task: Dict) -> None:
             )
             if shouldPrint:
                 print(
-                    f"[{divisionLabel}] {formatProgressBar(processedPlayers, totalPlayers)}",
+                    f"[{shardLabel}] {formatProgressBar(processedPlayers, totalPlayers)}",
                     flush=True,
                 )
                 lastProgressCount = processedPlayers
@@ -381,32 +388,37 @@ def matchFileWorkerLoop(
         task = item
         try:
             os.environ["RIOT_API_KEY"] = apiKey.strip()
-            runJsonlJob(task)
-            doneQueue.put(task["divisionLabel"])
+            runPlayerShardJob(task)
+            doneQueue.put(task["shardLabel"])
         except Exception as exc:
-            label = task.get("divisionLabel", "?") if isinstance(task, dict) else "?"
+            label = task.get("shardLabel", "?") if isinstance(task, dict) else "?"
             print(f"[worker] failed job {label}: {exc}", flush=True)
             doneQueue.put(("__error__", label, str(exc), task, apiKey.strip()))
             break
 
 
-def buildTasksForFolder(
+def buildShardTasksForFolder(
     playersFolder: Path,
     matchCluster: str,
     matchCount: int,
+    numShards: int,
 ) -> List[Dict]:
     runName = playersFolder.name
-    jsonlFiles = sorted(playersFolder.glob("*.jsonl"))
-    if not jsonlFiles:
+    if not any(playersFolder.glob("*.jsonl")):
         raise RuntimeError(f"No *.jsonl files in {playersFolder}")
 
+    allPlayers = loadAllPlayersFromRunFolder(playersFolder)
+    if not allPlayers:
+        raise RuntimeError(f"No valid player rows in *.jsonl under {playersFolder}")
+
     dataDirStr = str(dataDir.resolve())
+    shards = splitPlayersIntoShards(allPlayers, numShards)
     tasks: List[Dict] = []
-    for path in jsonlFiles:
+    for index, shard in enumerate(shards):
         tasks.append(
             {
-                "jsonlPath": str(path.resolve()),
-                "divisionLabel": path.stem,
+                "players": shard,
+                "shardLabel": f"shard-{index}",
                 "matchCluster": matchCluster,
                 "matchCount": matchCount,
                 "dataDirStr": dataDirStr,
@@ -422,7 +434,7 @@ def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
     if numWorkers == 1:
         os.environ["RIOT_API_KEY"] = apiKeys[0].strip()
         for task in tasks:
-            runJsonlJob(task)
+            runPlayerShardJob(task)
         return
 
     manager = multiprocessing.Manager()
@@ -448,7 +460,7 @@ def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
         while len(inFlight) < activeWorkers and pendingTasks:
             task = pendingTasks.popleft()
             taskQueue.put(task)
-            inFlight.add(task["divisionLabel"])
+            inFlight.add(task["shardLabel"])
 
     tryDispatch()
 
@@ -502,7 +514,7 @@ def runDynamicMatchPool(apiKeys: List[str], tasks: List[Dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch matches/timelines for each JSONL in a fetchPlayer run folder."
+        description="Fetch matches/timelines for all players in a fetchPlayer run (merged, sharded by API key)."
     )
     parser.add_argument(
         "--playersFolder",
@@ -524,11 +536,15 @@ def main() -> None:
     runName = playersFolder.name
     platformRegion = platformRegionFromRunName(runName)
     matchCluster = matchClusterForPlatform(platformRegion)
-    tasks = buildTasksForFolder(playersFolder, matchCluster, args.count)
+    tasks = buildShardTasksForFolder(playersFolder, matchCluster, args.count, len(apiKeys))
     print(f"Players folder: {playersFolder}", flush=True)
     print(f"Platform {platformRegion!r} -> match cluster {matchCluster!r}", flush=True)
-    print(f"Jobs ({len(tasks)}): " + " → ".join(t["divisionLabel"] for t in tasks), flush=True)
-    print(f"Output: {matchesDir / runName}/<division>/ and {timelinesDir / runName}/<division>/", flush=True)
+    totalPlayers = sum(len(t["players"]) for t in tasks)
+    print(
+        f"Shards ({len(tasks)}) for {len(apiKeys)} key(s); {totalPlayers} unique players",
+        flush=True,
+    )
+    print(f"Output: {matchesDir / runName}/ and {timelinesDir / runName}/", flush=True)
 
     runDynamicMatchPool(apiKeys, tasks)
     print("\nDone.", flush=True)

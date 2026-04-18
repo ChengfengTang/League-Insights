@@ -51,7 +51,7 @@ How we will achieve it (implementation plan)
    (queueId 420, mapId 11), and deduplicate by matchId across players so one
    unique match contributes all 10 participant timelines without duplicate files.
    In the current `Data/processMatch.py` pipeline, each processed match is
-   written as `Data/log/<run>/<division>/<matchId>.jsonl` with three parts:
+   written as `Data/log/<run>/<matchId>.jsonl` with three parts:
    `matchContext`, `junglerTrainingRows`, and `events`. `matchContext` stores
    the static information we know from champion select / loading screen or
    match metadata: `matchId`, patch, queue/map, both teams, all participant
@@ -66,6 +66,212 @@ How we will achieve it (implementation plan)
    `LEVEL_UP`. In practice, training uses `matchContext` as static conditioning,
    `junglerTrainingRows` as the per-time-step input/label source, and `events`
    as extra explanation for why a jungler changed route.
+
+Extracted features (reference table)
+-------------------------------------
+Source: `Data/processMatch.py` → each match file is
+`Data/log/<run>/<matchId>.jsonl` with keys `matchContext`,
+`junglerTrainingRows`, `events`.
+
+A) matchContext (static, once per file)
+
+  Field / block              Contents (high level)
+  -------------------------  --------------------------------------------------
+  rowType                    Always `static_match_context`.
+  matchId                    Riot match id string.
+  gameVersion                Patch string.
+  queueId, mapId             Queue and map (filter SR ranked in fetch).
+  gameDuration               Match length (seconds); end-state from metadata.
+  gameStartTimestamp         Wall-clock start (ms) if present.
+  teams[]                    Per team: teamId, win (bool), objectives{}.
+  participants[]             Per player: participantId, teamId, championId,
+                             championName, teamPosition, individualPosition,
+                             lane, role, summoner1Id, summoner2Id.
+  blueJungler, redJungler    participantId + champion for each jungle.
+
+B) junglerTrainingRows[] (one object per jungler per timeline frame; rowType
+   `jungler_frame`)
+
+  Field                      Contents
+  -------------------------  --------------------------------------------------
+  Identity / static repeat   matchId, gameVersion, queueId, mapId,
+                             gameDuration, participantId, teamId,
+                             championId, championName, teamPosition,
+                             individualPosition, summoner1Id, summoner2Id
+  Time / index               frameIndex, timestampMs
+  Position                   x, y
+  Progression                level, xp, currentGold, totalGold, csJungle,
+                             csLane
+  Combat / mobility          hp, hpMax, hpRatio, movementSpeed,
+                             timeEnemySpentControlled
+  One-step motion (lag 1)    dx1, dy1, distance1, speedPerSec1, timeDeltaMs1
+                             (from previous frame; nulls on first frame)
+  Supervision (horizon)      targetHorizonMs (default 60000), targetValid,
+                             targetX, targetY, targetDx, targetDy
+  Event aggregates at t      nearbyChampionKillsLast60s,
+                             nearbyDeathsLast60s, nearbyObjectiveEventsLast90s,
+                             nearestChampionKillDistance,
+                             nearestObjectiveDistance,
+                             timeSinceLastDragonMs, timeSinceLastHeraldMs,
+                             timeSinceLastBaronMs, isBlueSide
+
+C) events[] (filtered list for file output)
+
+  Only CHAMPION_KILL and ELITE_MONSTER_KILL with both x and y, and jungler
+  involved as killer, victim, or assist. Fields: timestampMs, type, x, y,
+  killerId; kills also victim, assists; objectives also monster,
+  monsterSubType.
+
+  Training rows still use the full event stream internally for the rolling
+  features above; this list is the human-readable / auxiliary sparse channel.
+
+Modeling notes: weights, motion ambiguity, gold, events
+-------------------------------------------------------
+These notes turn product intuition into experiment knobs (losses, weights,
+extra features). Nothing here requires changing the extractor unless we add
+new derived columns later.
+
+1) Sample weights: wins vs losses  
+   Idea: rows from matches where the jungler’s team won get higher weight than
+   losses, so the model prefers trajectories that correlate with winning play.
+   How to derive offline: from `matchContext.teams`, find `win` for teamId
+   100 vs 200; assign each jungler row a binary `junglerTeamWon` matching that
+   jungler’s `teamId`. Per-example weight:
+     w = w_win  if junglerTeamWon else w_loss
+   with w_win > w_loss > 0 (e.g. start 1.5 vs 1.0; tune on val). Apply inside
+   the loss (multiply per-sample loss) or when aggregating gradients.
+   Caveat: `win` is end-of-game; it is not a live feature at minute t, but it
+   is legitimate for **offline** imitation-style weighting (“trust winning
+   paths more”). Do not feed `win` as an input feature if the product must
+   mimic live inference.
+
+2) dx1, dy1, distance1, speedPerSec1, timeDeltaMs1 — what they are and limits  
+   They are **one backward step** on the timeline grid (typically ~60s apart):
+   displacement and speed from the immediately previous frame to the current.
+   They do **not** capture multi-minute intent; a jungler can reverse heading
+   between frames, so a single lag is a **noisy** cue. Mitigations:
+   - Stack several lags (dx2, dy2 over 2–3 frames) or feed a short sequence to
+     an RNN/Transformer instead of trusting only dx1.
+   - Treat one-step motion as a **weak** prior: pair with level/xp/cs and
+     objectives (below).
+   - For regression, use a loss that tolerates multimodality (Huber on error,
+     or discrete cells / mixture density) rather than assuming one direction
+     implies the next.
+
+3) Level timing, XP, jungle CS  
+   Strong signals for **path phase** and **style** (full clear vs heavy gank):
+   level jumps and XP curve vs game time; csJungle growth rate. Use deltas
+   (Δxp, ΔcsJungle over 1–3 frames) as features, not only levels. Align with
+   `targetHorizonMs` when building labels so phase is consistent.
+
+4) Movement speed  
+   Helps calibrate **how far** a champion can move per second between frames
+   when combined with `timeDeltaMs1`; also weak signal for slows / forms.
+   Useful as a continuous input; rarely worth a dedicated loss term.
+
+5) currentGold vs previous frame (recall / shop proxy)  
+   Define e.g. `deltaCurrentGold = currentGold_t - currentGold_{t-1}` (or ratio).
+   A **large negative** drop with no matching kill gold spike often correlates
+   with **spending on recall** (not deterministic). Use as one more scalar
+   feature; optional rule: cap or clip outliers. Product note: if the live
+   product never observes gold, train a variant without gold for deployment
+   parity.
+
+6) Nearby events — direct jungler involvement vs “ambient” nearby  
+   Current row features **collapse** nearby kills and nearby objectives into
+   counts and distances; they do not separate “this jungler got the kill” vs
+   “fight two screens away.” Ways to sharpen signal:
+   - **Decompose** (future extractor or dataloader): counts where killerId or
+     victim or assists equal this jungler vs only distance-based “ambient.”
+   - **Distance decay**: weight events by 1 / (1 + dist) instead of hard radius
+     only, or use two radii (tight = committed, wide = macro pressure).
+   - **Ablation study**: train with event block on vs off; measure val gain.
+   - Use the `events[]` list for **auxiliary supervision** (e.g. predict next
+     jungler-touched kill location) if we want explicit gank localization.
+
+Quantification (how to know these rules help)
+----------------------------------------------
+  - Win vs loss weights: grid-search (w_win, w_loss) on a **validation** split
+    by matchId; track mean distance error or grid log-loss **and** calibration.
+    Compare to w_win = w_loss baseline; stop if val worsens (overweighting
+    wins can bias toward passive paths).
+  - Motion / horizon: compare models with (a) position only, (b) +dx1/dy1,
+    (c) +multi-lag or sequence encoder; report same held-out metrics.
+  - Level / XP / csJungle: ablation removing progression block vs full model.
+  - movementSpeed: same ablation; expect small but consistent gain on
+    distance-normalized error if any.
+  - deltaCurrentGold: add as derived feature in the dataloader; ablation on/off;
+    inspect feature importance (tree) or gradient norms (NN).
+  - Events: train with rolling event features zeroed out vs full; optionally
+    add decomposed “jungler touched kill” counts and measure incremental val
+    gain.
+  - Rank / side (see below): report metrics **stratified** by ladder bucket and
+    by raw side vs canonicalized side, whenever those dimensions exist in the
+    dataloader metadata.
+
+Training-data design choices (for publication / reproducibility)
+-----------------------------------------------------------------
+These are explicit decisions from project discussion; they affect comparability
+across experiments and any downstream paper.
+
+A) Blue side vs red side — pool or split?  
+   Summoner’s Rift is approximately mirror-symmetric. Raw `(x, y)` without
+   handling side forces the model to learn the **same semantic path** in two
+   different corners of the map (blue vs red), wasting capacity.
+
+   **Recommended default:** train **one** model on **both** sides, after
+   **canonicalizing coordinates** to a single perspective (e.g. map all red-side
+   samples through a fixed mirror so “bot side jungle” always lands in the same
+   half of the feature space). Apply the **same** transform to:
+   - current `(x, y)` and supervision targets (`targetX`, `targetY`, `targetDx`,
+     `targetDy`);
+   - any event coordinates used as inputs or auxiliary tasks (`events[]`).
+
+   The per-row flag `isBlueSide` (or `teamId`) can remain as an **optional**
+   residual input **after** mirroring if ablations show real asymmetry (dragon
+   pit layout, meta, camera). If mirroring fully explains side effects, drop the
+   flag to reduce parameters.
+
+   **Not recommended** unless data-rich and hypothesis-driven: entirely separate
+   models per side (splits the dataset and hurts generalization).
+
+B) Rank / ladder — group logs by division or train together?  
+   On disk, logs live under `Data/log/<run>/<matchId>.jsonl` (flat per run); ladder
+   tier can be carried as metadata if needed. **Training does not require** separate
+   datasets per rank bucket.
+
+   **Default:** concatenate **all ranks** when fitting a champion-centric or
+   global model, to maximize samples per `championId` and learn coarse pathing
+   that is largely rank-invariant (camps, timers, geometry).
+
+   **Caveat — distribution shift:** high-elo games differ in tempo and risk;
+   low-elo has more noise. Pooling can yield a model that is **average** across
+   skill bands.
+
+   **Mitigations (pick one or combine):**
+   1. **Conditioning:** add a categorical ladder bucket (from folder name or
+      metadata) or a coarse `skillBin` as an input / embedding. The model can
+      learn rank-specific residuals without discarding data.
+   2. **Mild sample weights:** up-weight the tier closest to the **deployment**
+      audience (e.g. Diamond+), keep weights close to 1.0 elsewhere; tune on
+      validation. Avoid extreme weights that make rare tiers dominate gradients.
+   3. **Stratified evaluation:** always report held-out error / log-loss **per**
+      ladder bucket and per patch (`gameVersion`), not only aggregate metrics.
+
+   **Higher elo = “better labels”?** Not automatically. Top players are more
+   consistent in some respects but also play rarer lines; overweighting them
+   shrinks effective sample size and can hurt users at other ranks. Treat elo
+   weighting as a **hypothesis** to validate, not a default.
+
+C) Champion grouping — one model vs many  
+   **Per-champion** models need enough rows; pooling ranks helps. A **single**
+   shared model with a `championId` embedding (and summoner spell / patch
+   embeddings as needed) usually generalizes better than dozens of tiny
+   per-champion nets unless data per champion is very large.
+
+   Record in any write-up: which grouping was used, and whether rank/side
+   canonicalization was applied **before** train/val/test splits (it should be
+   applied consistently per row, not leaking test matches into normalization).
 
 2. Baselines  
    Persistence (same quadrant as last step) and low-order Markov models on

@@ -1,9 +1,18 @@
 """
 Process raw match and timeline JSON into one ML-ready `<matchId>.jsonl` per match.
 
+Reads flat `Data/matches/<run>/*.json` with `Data/timelines/<run>/<matchId>_timeline.json`.
+Writes `Data/log/<run>/<matchId>.jsonl` (no division subfolders).
+
 Example:
   python3 Data/processMatch.py na1-ranked-solo-5x5-20260413-235836
 """
+
+# Gold drop to indicate backing (use movement speed and time delta to indicate)
+# Add Death respawn info (calculate respawn time from level and game minutes)
+# Utilize jg cs delta to indicate path phase
+# Large jg monster
+# Turret kill
 
 from __future__ import annotations
 
@@ -49,11 +58,21 @@ def resolveMatchesRunDir(runName: str) -> Path:
     return root
 
 
-def workerProcessCount(numJobs: int) -> int:
-    """Use exactly one worker per division job."""
-    if numJobs <= 0:
+def workerProcessCount(numChunks: int) -> int:
+    """Run up to one process per match chunk (each chunk is a list of match files)."""
+    if numChunks <= 0:
         return 0
-    return max(1, numJobs)
+    return max(1, numChunks)
+
+
+def chunkMatchPaths(matchPaths: List[Path], numChunks: int) -> List[List[Path]]:
+    if not matchPaths:
+        return []
+    numChunks = max(1, min(numChunks, len(matchPaths)))
+    buckets: List[List[Path]] = [[] for _ in range(numChunks)]
+    for index, path in enumerate(matchPaths):
+        buckets[index % numChunks].append(path)
+    return buckets
 
 
 def distanceBetween(x1: Optional[float], y1: Optional[float], x2: Optional[float], y2: Optional[float]) -> Optional[float]:
@@ -416,29 +435,29 @@ def processOneMatchFiles(matchPath: Path, timelinePath: Path, outputPath: Path) 
     return True
 
 
-def processDivisionJob(task: Dict) -> None:
-    """All *.json matches under one division folder (paired with timelines/<run>/<division>/)."""
+def processMatchChunkJob(task: Dict) -> None:
+    """Process a chunk of flat `matches/<run>/*.json` with paired timelines under `timelines/<run>/`."""
     runName = task["runName"]
-    divisionLabel = task["divisionLabel"]
-    matchesDivisionDir = Path(task["matchesDivisionDir"])
-    timelinesDivisionDir = Path(task["timelinesDivisionDir"])
+    chunkLabel = task["chunkLabel"]
     dataDirPath = Path(task["dataDirStr"])
+    timelinesRunDir = timelinesDir / runName
+    logRunDir = logRootDir / runName
+    logRunDir.mkdir(parents=True, exist_ok=True)
 
-    matchFiles = sorted(matchesDivisionDir.glob("*.json"))
-    totalMatches = len(matchFiles)
+    matchPaths = [Path(p) for p in task["matchPaths"]]
+    totalMatches = len(matchPaths)
     processedMatches = 0
     lastProgressCount = -1
     lastProgressTime = 0.0
 
-    print(f"[{divisionLabel}] {formatProgressBar(0, max(1, totalMatches))}", flush=True)
+    print(f"[{chunkLabel}] {formatProgressBar(0, max(1, totalMatches))}", flush=True)
 
-    for matchPath in matchFiles:
+    for matchPath in matchPaths:
         matchId = matchPath.stem
-        timelinePath = timelinesDivisionDir / f"{matchId}_timeline.json"
-        outputPath = dataDirPath / "log" / runName / divisionLabel / f"{matchId}.jsonl"
+        timelinePath = timelinesRunDir / f"{matchId}_timeline.json"
+        outputPath = logRunDir / f"{matchId}.jsonl"
         try:
             if outputPath.exists():
-                # Already logged; clean up raw files if they still exist.
                 if matchPath.exists():
                     matchPath.unlink()
                 if timelinePath.exists():
@@ -447,17 +466,16 @@ def processDivisionJob(task: Dict) -> None:
             else:
                 success = processOneMatchFiles(matchPath, timelinePath, outputPath)
                 if success:
-                    # Delete raw inputs after successful logging.
                     if matchPath.exists():
                         matchPath.unlink()
                     if timelinePath.exists():
                         timelinePath.unlink()
         except Exception as exc:
             success = False
-            print(f"[{divisionLabel}] Failed {matchId}: {exc}", flush=True)
+            print(f"[{chunkLabel}] Failed {matchId}: {exc}", flush=True)
 
         if not success:
-            print(f"[{divisionLabel}] Unsuccessful log for {matchId}", flush=True)
+            print(f"[{chunkLabel}] Unsuccessful log for {matchId}", flush=True)
 
         processedMatches += 1
         now = time.time()
@@ -468,36 +486,38 @@ def processDivisionJob(task: Dict) -> None:
         )
         if shouldPrint:
             print(
-                f"[{divisionLabel}] {formatProgressBar(processedMatches, totalMatches)}",
+                f"[{chunkLabel}] {formatProgressBar(processedMatches, totalMatches)}",
                 flush=True,
             )
             lastProgressCount = processedMatches
             lastProgressTime = now
 
-def buildDivisionTasks(matchesRunRoot: Path) -> List[Dict]:
+
+def buildMatchChunkTasks(matchesRunRoot: Path) -> List[Dict]:
     runName = matchesRunRoot.name
     dataDirStr = str(dataDir.resolve())
-    tasks: List[Dict] = []
+    matchFiles = sorted(matchesRunRoot.glob("*.json"))
+    if not matchFiles:
+        return []
 
-    for divisionDir in sorted(matchesRunRoot.iterdir()):
-        if not divisionDir.is_dir():
-            continue
-        divisionLabel = divisionDir.name
-        if not any(divisionDir.glob("*.json")):
-            continue
+    cpus = multiprocessing.cpu_count() or 4
+    numChunks = max(1, min(cpus, len(matchFiles)))
+    chunks = chunkMatchPaths(matchFiles, numChunks)
+
+    tasks: List[Dict] = []
+    for index, paths in enumerate(chunks):
         tasks.append(
             {
                 "runName": runName,
-                "divisionLabel": divisionLabel,
-                "matchesDivisionDir": str(divisionDir.resolve()),
-                "timelinesDivisionDir": str((timelinesDir / runName / divisionLabel).resolve()),
+                "chunkLabel": f"chunk-{index}",
+                "matchPaths": [str(p.resolve()) for p in paths],
                 "dataDirStr": dataDirStr,
             }
         )
     return tasks
 
 
-def divisionWorkerLoop(
+def matchChunkWorkerLoop(
     taskQueue: "multiprocessing.Queue",
     doneQueue: "multiprocessing.Queue",
 ) -> None:
@@ -507,25 +527,25 @@ def divisionWorkerLoop(
             break
         task = item
         try:
-            processDivisionJob(task)
-            doneQueue.put(task["divisionLabel"])
+            processMatchChunkJob(task)
+            doneQueue.put(task["chunkLabel"])
         except Exception as exc:
-            label = task.get("divisionLabel", "?") if isinstance(task, dict) else "?"
+            label = task.get("chunkLabel", "?") if isinstance(task, dict) else "?"
             print(f"[worker] failed job {label}: {exc}", flush=True)
             doneQueue.put(("__error__", str(exc)))
 
 
-def runDynamicDivisionPool(tasks: List[Dict]) -> None:
+def runDynamicMatchChunkPool(tasks: List[Dict]) -> None:
     numJobs = len(tasks)
     numWorkers = workerProcessCount(numJobs)
 
     if numJobs == 0:
-        print("No division folders with match JSON found.")
+        print("No match JSON files found under the run folder.")
         return
 
     if numWorkers == 1:
         for task in tasks:
-            processDivisionJob(task)
+            processMatchChunkJob(task)
         return
 
     manager = multiprocessing.Manager()
@@ -535,7 +555,7 @@ def runDynamicDivisionPool(tasks: List[Dict]) -> None:
     workers: List[multiprocessing.Process] = []
     for _ in range(numWorkers):
         proc = multiprocessing.Process(
-            target=divisionWorkerLoop,
+            target=matchChunkWorkerLoop,
             args=(taskQueue, doneQueue),
         )
         proc.start()
@@ -550,7 +570,7 @@ def runDynamicDivisionPool(tasks: List[Dict]) -> None:
             task = tasks[nextJobIndex]
             nextJobIndex += 1
             taskQueue.put(task)
-            inFlight.add(task["divisionLabel"])
+            inFlight.add(task["chunkLabel"])
 
     tryDispatch()
 
@@ -580,7 +600,7 @@ def runDynamicDivisionPool(tasks: List[Dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Process match JSON into logs for one fetchMatch run under Data/matches/<runName>/."
+        description="Process flat match JSON under Data/matches/<runName>/ into Data/log/<runName>/."
     )
     parser.add_argument(
         "runName",
@@ -589,18 +609,18 @@ def main() -> None:
     args = parser.parse_args()
 
     matchesRunRoot = resolveMatchesRunDir(args.runName)
-    tasks = buildDivisionTasks(matchesRunRoot)
+    tasks = buildMatchChunkTasks(matchesRunRoot)
 
     print(f"Matches run: {matchesRunRoot}")
     if not tasks:
-        print("No division folders with match JSON found.")
+        print("No *.json match files found directly under the run folder.")
         return
     numWorkers = workerProcessCount(len(tasks))
-    print(f"Jobs ({len(tasks)}): " + " → ".join(t["divisionLabel"] for t in tasks))
-    print(f"Worker processes: {numWorkers} (one per division)")
-    print(f"Log root: {logRootDir / matchesRunRoot.name}/<division>/<matchId>.jsonl")
+    totalFiles = sum(len(t["matchPaths"]) for t in tasks)
+    print(f"Chunks ({len(tasks)}), {totalFiles} matches, up to {numWorkers} worker processes")
+    print(f"Log root: {logRootDir / matchesRunRoot.name}/<matchId>.jsonl")
 
-    runDynamicDivisionPool(tasks)
+    runDynamicMatchChunkPool(tasks)
     shutil.rmtree(matchesRunRoot, ignore_errors=True)
     shutil.rmtree(timelinesDir / matchesRunRoot.name, ignore_errors=True)
     print("\nDone.")

@@ -154,6 +154,9 @@ const displayedEvents = new Set();
 let isPlaying = true;
 let deathWindowsByPid = {}; // participantId -> [{ deathTime, respawnTime, team }]
 let participantsById = {};
+let lastRenderedCanvasPosByPid = {}; // participantId -> { x, y, wasDeadVisual, t }
+let movementSegments = []; // [{ x1, y1, x2, y2, createdAt }]
+const MOVEMENT_SEGMENT_TTL = 20; // in game-seconds
 
 function msToMinSec(ms) {
   const m = Math.floor(ms / 60000);
@@ -206,6 +209,13 @@ function getBasePosition(team) {
   return team === "Blue" ? { x: 554, y: 581 } : { x: 14500, y: 14511 };
 }
 
+function isNearBaseCanvasPosition(x, y, team) {
+  const base = getBasePosition(team);
+  const baseX = (base.x / 15000) * mapSize * scaleFactor;
+  const baseY = ((15000 - base.y) / 15000) * mapSize * scaleFactor;
+  return Math.hypot(x - baseX, y - baseY) <= 22;
+}
+
 function getLatestPointAtOrBefore(points, t) {
   let latest = null;
   for (const point of points) {
@@ -238,6 +248,39 @@ function getMostRecentRespawnWindow(participantId, t) {
     else break;
   }
   return best;
+}
+
+function getLatestRelevantEventPosition(participantId, t) {
+  let latest = null;
+  for (const e of events) {
+    if (!e.position || e.timeSeconds > t) continue;
+    if (e.type === "RESPAWN" && e.participantId === participantId) {
+      latest = e;
+      continue;
+    }
+    if (e.type === "CHAMPION_KILL") {
+      const involved =
+        e.killerId === participantId ||
+        e.victimId === participantId ||
+        (e.assistingParticipantIds || []).includes(participantId);
+      if (involved) latest = e;
+      continue;
+    }
+    if (e.type === "ASSIST" && (e.assistingParticipantIds || []).includes(participantId)) {
+      latest = e;
+      continue;
+    }
+    if (e.type === "ELITE_MONSTER_KILL" && e.killerId === participantId) {
+      latest = e;
+    }
+  }
+  return latest;
+}
+
+function participantJitterSeed(participantId) {
+  // Deterministic small seed so overlapping icons spread consistently.
+  const n = Number(participantId) || 0;
+  return (n * 2654435761) >>> 0;
 }
 
 function buildLiveKdaByParticipant(t) {
@@ -421,7 +464,8 @@ async function fetchData() {
           deathWindowsByPid[event.victimId].push({
             deathTime: eventTimeSec,
             respawnTime: respawnTimeSec,
-            team: champMap[event.victimId].team
+            team: champMap[event.victimId].team,
+            deathPosition: event.position || null
           });
 
           // Add assist events
@@ -484,6 +528,8 @@ async function setup() {
     currentGameTime = parseFloat(slider.value);
     document.getElementById('sliderTime').textContent = secondsToMinSec(currentGameTime);
     displayedEvents.clear();
+    lastRenderedCanvasPosByPid = {};
+    movementSegments = [];
     document.getElementById('log').innerHTML = '<b>📜 Event Log</b><br />';
   });
 }
@@ -508,6 +554,8 @@ function draw() {
       if (currentGameTime > maxGameTime) {
         currentGameTime = 0;
         displayedEvents.clear();
+        lastRenderedCanvasPosByPid = {};
+        movementSegments = [];
         document.getElementById('log').innerHTML = '<b>📜 Event Log</b><br />';
       }
       document.getElementById('timeSlider').value = currentGameTime;
@@ -521,16 +569,36 @@ function draw() {
     grouped[point.id].push(point);
   }
 
+  const drawCandidates = [];
   for (const [pid, points] of Object.entries(grouped)) {
     const participantId = parseInt(pid);
     const activeDeath = getActiveDeathWindow(participantId, currentGameTime);
     let pos = null;
-    let shouldDraw = !activeDeath;
+    let shouldDraw = true;
+    let isDeadVisual = false;
 
-    if (shouldDraw) {
+    if (activeDeath) {
+      // While dead, keep icon fixed at death position and render a dimmed marker style.
+      isDeadVisual = true;
+      if (activeDeath.deathPosition) {
+        pos = { x: activeDeath.deathPosition.x, y: activeDeath.deathPosition.y };
+      } else {
+        const beforeDeath = getLatestPointAtOrBefore(points, activeDeath.deathTime);
+        if (beforeDeath) {
+          pos = { x: beforeDeath.x, y: beforeDeath.y };
+        }
+      }
+    } else {
       const latest = getLatestPointAtOrBefore(points, currentGameTime);
+      const latestEventPos = getLatestRelevantEventPosition(participantId, currentGameTime);
       const lastRespawn = getMostRecentRespawnWindow(participantId, currentGameTime);
-      if (latest) {
+
+      const latestTimelineTs = latest ? latest.timeSeconds : -1;
+      const latestEventTs = latestEventPos ? latestEventPos.timeSeconds : -1;
+      if (latestEventTs >= latestTimelineTs && latestEventPos) {
+        // No interpolation: icon snaps to latest relevant event position.
+        pos = { x: latestEventPos.position.x, y: latestEventPos.position.y };
+      } else if (latest) {
         // No interpolation: icon snaps to latest recorded frame position.
         pos = { x: latest.x, y: latest.y };
       } else if (lastRespawn) {
@@ -552,19 +620,103 @@ function draw() {
     if (shouldDraw && pos) {
       const x = (pos.x / 15000) * mapSize * scaleFactor;
       const y = ((15000 - pos.y) / 15000) * mapSize * scaleFactor;
-      imageMode(CENTER);
-      let champ = champMap[pid];
-      let icon = champ && champIconMap[champ.name];
-      if (icon) {
-        strokeWeight(3);
-        stroke(champ.team === "Blue" ? color(0, 128, 255) : color(255, 0, 0));
-        rect(x - 16, y - 16, 32, 32);
-        noStroke();
-        image(icon, x, y, 32, 32);
-      }
-      imageMode(CORNER);
+      drawCandidates.push({
+        pid,
+        participantId,
+        x,
+        y,
+        isDeadVisual
+      });
     }
   }
+
+  // Bucket candidates to spread and resize icons when they overlap.
+  const bucketGroups = new Map();
+  for (const candidate of drawCandidates) {
+    const bucketKey = `${Math.round(candidate.x / 10)}:${Math.round(candidate.y / 10)}`;
+    if (!bucketGroups.has(bucketKey)) bucketGroups.set(bucketKey, []);
+    bucketGroups.get(bucketKey).push(candidate);
+  }
+
+  for (const group of bucketGroups.values()) {
+    const n = group.length;
+    const iconSize = Math.max(16, 32 - (n - 1) * 2);
+    const baseRadius = n <= 1 ? 0 : Math.min(26, 6 + (n - 1) * 2);
+
+    group.sort((a, b) => a.participantId - b.participantId);
+
+    for (let i = 0; i < group.length; i++) {
+      const candidate = group[i];
+      let x = candidate.x;
+      let y = candidate.y;
+
+      if (n > 1) {
+        const angle = (2 * Math.PI * i) / n;
+        x += Math.cos(angle) * baseRadius;
+        y += Math.sin(angle) * baseRadius;
+      }
+
+      const prevRender = lastRenderedCanvasPosByPid[candidate.participantId];
+      if (
+        prevRender &&
+        (Math.abs(prevRender.x - x) > 0.5 || Math.abs(prevRender.y - y) > 0.5)
+      ) {
+        const team = champMap[candidate.pid]?.team || "Blue";
+        const isDeathToBaseRespawnJump =
+          prevRender.wasDeadVisual &&
+          !candidate.isDeadVisual &&
+          isNearBaseCanvasPosition(x, y, team);
+
+        if (!isDeathToBaseRespawnJump) {
+          movementSegments.push({
+            x1: prevRender.x,
+            y1: prevRender.y,
+            x2: x,
+            y2: y,
+            createdAt: currentGameTime
+          });
+        }
+      }
+
+      imageMode(CENTER);
+      let champ = champMap[candidate.pid];
+      let icon = champ && champIconMap[champ.name];
+      if (icon) {
+        strokeWeight(2.5);
+        if (candidate.isDeadVisual) {
+          stroke(120, 120, 120);
+          tint(150, 150, 150, 140);
+        } else {
+          stroke(champ.team === "Blue" ? color(0, 128, 255) : color(255, 0, 0));
+          noTint();
+        }
+        rect(x - iconSize / 2, y - iconSize / 2, iconSize, iconSize);
+        noStroke();
+        image(icon, x, y, iconSize, iconSize);
+        noTint();
+      }
+      imageMode(CORNER);
+      lastRenderedCanvasPosByPid[candidate.participantId] = {
+        x,
+        y,
+        wasDeadVisual: candidate.isDeadVisual,
+        t: currentGameTime
+      };
+    }
+  }
+
+  // Draw movement connectors after icon updates, keep a short fading history.
+  movementSegments = movementSegments.filter(
+    (segment) => currentGameTime - segment.createdAt <= MOVEMENT_SEGMENT_TTL
+  );
+  for (const segment of movementSegments) {
+    const age = currentGameTime - segment.createdAt;
+    const alpha = Math.max(40, 220 - (age / MOVEMENT_SEGMENT_TTL) * 220);
+    stroke(240, 240, 240, alpha);
+    strokeWeight(2);
+    line(segment.x1, segment.y1, segment.x2, segment.y2);
+  }
+  noStroke();
 
   renderStatsPanel(grouped);
 
@@ -580,21 +732,6 @@ function draw() {
       document.getElementById("log").appendChild(div);
     }
 
-    if (
-      currentGameTime >= eventTime &&
-      currentGameTime <= eventTime + 30 &&
-      /\(\d+, \d+\)/.test(e.event)
-    ) {
-      const match = e.event.match(/\((\d+), (\d+)\)/);
-      if (match) {
-        const [_, xRaw, yRaw] = match.map(Number);
-        const x = (xRaw / 15000) * mapSize * scaleFactor;
-        const y = ((15000 - yRaw) / 15000) * mapSize * scaleFactor;
-        fill(255);
-        textSize(18);
-        text("\uD83D\uDC80", x - 8, y + 8);
-      }
-    }
   }
 
   const m = Math.floor(currentGameTime / 60);
