@@ -46,10 +46,22 @@ How we will achieve it (implementation plan)
    role-aligned opponents; label = quadrant at t + h. Avoid leakage: no
    future CS, kills, or events not observable at t. Optionally normalize map
    coordinates to one team perspective or augment with mirror flips to reduce
-   blue/red artifacts. Collection policy: fetch up to 100 matches per player
+   blue/red artifacts.    Collection policy: fetch up to 100 matches per player
    (or fewer if unavailable), restrict to Ranked Solo/Duo on Summoner's Rift
    (queueId 420, mapId 11), and deduplicate by matchId across players so one
    unique match contributes all 10 participant timelines without duplicate files.
+
+   Repository `Data/` flow (bulk): `fetchPlayer.py` writes ladder JSONL under
+   `Data/players/<run>/` with **`username`** and **`tag`** per line; `fetchMatch.py`
+   merges players by Riot ID, resolves **puuid** via the Account API, downloads
+   flat `Data/matches/<run>/` and `Data/timelines/<run>/`, and **skips** a matchId
+   when match JSON, timeline JSON, or an existing `Data/log/<run>/<matchId>.jsonl`
+   is already on disk for that run. `processMatch.py` reads those pairs, writes
+   `Data/log/<run>/<matchId>.jsonl`, then **removes** the run’s `matches/` and
+   `timelines/` trees to save space. Optionally `sortLog.py` copies each log into
+   `Data/log (champions)/<junglerChampion>/<matchId>.jsonl` for champion-centric
+   tooling (same JSON shape as `processMatch` output).
+
    In the current `Data/processMatch.py` pipeline, each processed match is
    written as `Data/log/<run>/<matchId>.jsonl` with three parts:
    `matchContext`, `junglerTrainingRows`, and `events`. `matchContext` stores
@@ -237,8 +249,10 @@ A) Blue side vs red side — pool or split?
 
 B) Rank / ladder — group logs by division or train together?  
    On disk, logs live under `Data/log/<run>/<matchId>.jsonl` (flat per run); ladder
-   tier can be carried as metadata if needed. **Training does not require** separate
-   datasets per rank bucket.
+   tier can be inferred from the run folder name or other metadata if needed.
+   For jungler-champion–bucketed copies (same file content, different layout), run
+   `Data/sortLog.py` to populate `Data/log (champions)/<champion>/<matchId>.jsonl`.
+   **Training does not require** separate datasets per rank bucket.
 
    **Default:** concatenate **all ranks** when fitting a champion-centric or
    global model, to maximize samples per `championId` and learn coarse pathing
@@ -307,4 +321,5 @@ C) Champion grouping — one model vs many
 
 This note guides experiments in the Predict/ pipeline; implementation details
 (code paths, exact grid, horizon h) live alongside the dataset builders and
-training scripts as they are added.
+training scripts as they are added. For disk layout and script flags, see the
+repository **`README.md`** (`Data/` section).
