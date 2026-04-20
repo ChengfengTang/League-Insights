@@ -38,6 +38,158 @@ needed. Champion identity and coarse playstyle categories (see champCategory.py
 for jungler-oriented groupings) may enter as categoricals or embeddings; role,
 team side, and game phase are candidates for additional conditioning.
 
+Formal task definition (enemy jungler pathing first)
+----------------------------------------------------
+Primary scope for v1 is enemy-jungler path prediction during laning phase.
+We define:
+
+- t: current frame time in milliseconds.
+- h: prediction horizon (default h = 60000 ms).
+- T_lane: laning cutoff (default T_lane = 14 * 60 * 1000 ms).
+- x_t: feature vector at time t.
+- y_t: supervision target at time t + h (continuous or discretized).
+- m_t in {0,1}: validity mask, where m_t = 1 iff `targetValid` is true and
+  t <= T_lane.
+
+Per-row inclusion criterion:
+  include row r_t <=> m_t = 1.
+
+Target options:
+1) Continuous regression:
+   y_t = [targetX, targetY] or [targetDx, targetDy].
+2) Discrete classification:
+   y_t = c_t where c_t is a map cell / quadrant index derived from targetX/Y.
+
+The initial project decision is to start with enemy-jungler pathing only,
+then expand to recommendation tasks after the enemy-location baseline is stable.
+
+Feature partition and notation
+------------------------------
+We partition features into three groups:
+
+- Data evidence features D_t:
+  position/motion, level/xp/cs, hp/gold, event aggregates, side/champion.
+- Style-prior features P_t:
+  champion playstyle category and suggested-clear-path signals
+  (e.g., distance to suggested camp, clear prior score).
+- Context features C:
+  static match/champion metadata (when available and leakage-safe for the
+  specific task phase).
+
+Model input:
+  x_t = concat(D_t, P_t, C).
+
+Important leakage rule:
+- End-of-game outcomes (e.g., team win) are never fed as inference-time inputs.
+- They may be used only for offline sample weighting (see below).
+
+Laning-phase gating and masks
+-----------------------------
+Training mask:
+  m_t = 1[targetValid_t = 1 and timestampMs_t <= T_lane]
+
+Effective sample set:
+  S = {t | m_t = 1}
+
+All losses and metrics are computed over S unless explicitly stated otherwise.
+
+Weighted objective (data quality and product alignment)
+-------------------------------------------------------
+We use a multiplicative per-sample weight:
+
+  w_t = w_win(t) * w_rank(t) * w_conf(t)
+
+where:
+- w_win(t): optional win/loss reliability weight for the jungler team
+  (for imitation-style bias toward successful trajectories).
+- w_rank(t): optional rank-bucket emphasis weight
+  (for deployment-target alignment without hard rank splitting).
+- w_conf(t): optional confidence/quality factor
+  (e.g., stronger sightings, lower missingness, better event support).
+
+Recommended starting point:
+- w_win in {1.0, 1.25, 1.5} for won rows and 1.0 for lost rows.
+- w_rank near 1.0 for all buckets unless a target audience is explicit.
+- keep w_conf = 1.0 initially.
+
+Loss for regression (Huber):
+  L_reg = (sum_{t in S} w_t * huber(y_t, yhat_t)) / (sum_{t in S} w_t)
+
+Loss for classification (cross-entropy):
+  L_cls = (sum_{t in S} w_t * CE(c_t, phat_t)) / (sum_{t in S} w_t)
+
+where phat_t is predicted probability over cells.
+
+Prior-vs-data blending (clear-path priors)
+------------------------------------------
+To encode early-game uncertainty, we treat recommended clear routes as a soft
+prior and match-derived features as evidence.
+
+Let:
+- s_prior_t in [0,1]: prior score (e.g., from expected-camp distance).
+- alpha_prior >= 0: prior weight.
+- alpha_data >= 0: data-evidence weight.
+
+A simple blended feature:
+  b_t = alpha_prior * s_prior_t + alpha_data * 1.0
+
+This b_t is provided to the model as an input (not as a hard constraint), so
+the network can override priors when evidence contradicts them.
+
+Alternative probabilistic view (for later versions):
+  p(y_t | x_t) propto p_data(y_t | D_t, C)^(alpha_data) * p_prior(y_t | P_t)^(alpha_prior)
+
+This formulation makes the role of prior weighting explicit and tunable.
+
+Side canonicalization and symmetry
+----------------------------------
+Default training policy is one shared model over both blue and red side after
+coordinate canonicalization (mirror transform to one reference perspective).
+The same transform must be applied consistently to:
+- current position,
+- targets,
+- event coordinates used as inputs.
+
+This reduces duplicated side-specific geometry learning and improves sample
+efficiency. Side flags can be retained as residual features and ablated.
+
+Rank strategy and pooling
+-------------------------
+Default strategy is pooled training across ranks to maximize sample size and
+avoid over-fragmentation. Rank is treated as:
+- optional conditioning feature, and/or
+- mild weighting factor for deployment alignment.
+
+Hard per-rank model splitting is not default due to reduced effective data and
+higher variance.
+
+Evaluation protocol (publication-grade)
+---------------------------------------
+Split discipline:
+- hold out by matchId (or by player) to prevent temporal/identity leakage.
+- never split individual rows from the same match across train/val/test.
+
+Core metrics:
+- regression: mean/median distance error, radius-hit rates.
+- classification: log-loss, top-1/top-k accuracy, calibration.
+
+Stratified reports (mandatory):
+- by rank bucket,
+- by patch (`gameVersion`),
+- by side handling (raw vs canonicalized),
+- optionally by champion or playstyle category.
+
+Ablation matrix (minimum):
+- remove prior block P_t.
+- remove motion block (dx/dy/speed).
+- remove event block.
+- remove gold-derived features.
+- change alpha_prior / alpha_data.
+- toggle win/rank weights.
+
+A change is accepted only when aggregate and key stratified metrics improve or
+trade-offs are explicitly justified.
+
 How we will achieve it (implementation plan)
 --------------------------------------------
 1. Data construction  
@@ -50,6 +202,13 @@ How we will achieve it (implementation plan)
    (or fewer if unavailable), restrict to Ranked Solo/Duo on Summoner's Rift
    (queueId 420, mapId 11), and deduplicate by matchId across players so one
    unique match contributes all 10 participant timelines without duplicate files.
+   Planning numbers: `fetchMatch.py` defaults to **`--count 100`** (max match IDs
+   requested from each player's match history per run). In practice, bulk
+   download throughput is on the order of **~20 completed matches per minute per
+   development API key** (each unique match is match JSON plus timeline JSON, so
+   rate limits dominate). The corpus we are aiming for is on the order of
+   **~700,000 unique matches** after cross-player deduplication—not 100× players
+   raw, because many accounts share the same games.
 
    Repository `Data/` flow (bulk): `fetchPlayer.py` writes ladder JSONL under
    `Data/players/<run>/` with **`username`** and **`tag`** per line; `fetchMatch.py`

@@ -17,6 +17,8 @@ Scripts live under `Data/` and are intended to be run from the **repository root
 | **`Data/processMatch.py`** | **Offline only.** Takes a single **positional argument**, the run name (for example `na1-ranked-solo-5x5-20260413-235836`). Reads flat `Data/matches/<runName>/*.json` with `Data/timelines/<runName>/`. Splits match files across up to **`CPU count`** worker processes (chunk jobs). Writes `Data/log/<runName>/<matchId>.jsonl`. After a successful run, **deletes** `Data/matches/<runName>/` and `Data/timelines/<runName>/` to free disk (logs remain). |
 | **`Data/sortLog.py`** | **Offline only.** Optional. Scans flat `Data/log/<run>/*.jsonl`, reads each file’s `matchContext` for blue/red jungler **`championName`**, and copies the full JSON object into `Data/log (champions)/<championName>/<matchId>.jsonl` (one copy per jungler champion; skips if the destination file exists). Single-threaded; useful for champion-centric training folders. |
 
+**Bulk collection (rough planning numbers):** Expect on the order of **~20 completed matches per minute per development API key** once downloads are steady (each `matchId` needs match metadata plus timeline). The default **`--count 100`** caps how many match-history IDs are requested **per player**; cross-player **`matchId` deduplication** means the unique corpus is much smaller than “100 × number of players.” A full multi-ladder pass is sized around **~700,000 unique matches** at the intended scale.
+
 **Typical flow:** run `fetchPlayer`, then `fetchMatch` using the same player run folder, then `processMatch` using the same directory name as under `matches/`. Optionally run **`sortLog`** afterward to populate `Data/log (champions)/`. The `Data/` scripts require the **`requests`** library (`pip install requests`) for anything that calls Riot.
 
 **Script names:** The current pipeline uses **`Data/fetchPlayer.py`**, **`Data/fetchMatch.py`**, **`Data/processMatch.py`**, and optionally **`Data/sortLog.py`**. Older notes or forks may mention names such as **`fetchTopRankedPlayers.py`**; that is not part of this layout anymore.
@@ -32,6 +34,7 @@ ML pipeline for jungler path prediction and analysis.
 - **Data fetching**: `fetchdata.py` - Riot API utilities.
 - **Champion categorization**: `TDchampCategory.py` - playstyle labels (for example aggressive, full_clear).
 - **Model training**: `TDpredict.py` - models for enemy jungler location prediction.
+- **Starter dataset builder**: `loadData.py` - builds laning-phase (default first 14 minutes) enemy-jungler training rows from `Data/log/` and supports blending champion clear-path priors with match-derived features.
 - **YOLO champion icons** (`Predict/yolo/`): Data Dragon icons, synthetic YOLO data, Ultralytics YOLOv8 training; `Live/yolo_detect.py` runs on minimap crops (see `Predict/yolo/README.md`).
 - **Model artifacts**: Intended location `models/` inside Predict.
 
@@ -191,6 +194,7 @@ python Data/sortLog.py
 - Per-timestamp player stats: position, level, CS, gold.
 - Events: champion kills, assists, epic monsters, level-ups, deaths and respawns.
 - Champion playstyle categories.
+- Enemy-jungler pathing focus with laning-phase-first workflows and optional clear-path priors.
 - Model training and optional category-specific models.
 
 ### Live game monitoring (Live)

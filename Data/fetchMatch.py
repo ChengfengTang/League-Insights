@@ -226,20 +226,24 @@ def isEligibleMatchMetadata(matchData: Dict[str, Any]) -> bool:
 
 def matchAlreadyStoredOrProcessed(dataDirPath: Path, runName: str, matchId: str) -> bool:
     """
-    Duplicate detector across raw + processed outputs for this run (flat layout).
+    Duplicate detector across raw + processed outputs for this run.
 
     Checks:
       - Data/matches/<run>/<matchId>.json
       - Data/timelines/<run>/<matchId>_timeline.json
-      - Data/log/<run>/<matchId>.jsonl
+      - Data/log/<run>/.done/<matchId>
+      - Data/log/<run>/<ChampionName>/<matchId>_p<participantId>_<side>.json
     """
     matchPath = dataDirPath / "matches" / runName / f"{matchId}.json"
     timelinePath = dataDirPath / "timelines" / runName / f"{matchId}_timeline.json"
-    processedLogPath = dataDirPath / "log" / runName / f"{matchId}.jsonl"
+    logRunDir = dataDirPath / "log" / runName
+    doneMarkerPath = logRunDir / ".done" / matchId
+    groupedLogExists = any(logRunDir.glob(f"*/{matchId}_p*_*.json"))
     return (
         matchPath.exists()
         or timelinePath.exists()
-        or processedLogPath.exists()
+        or doneMarkerPath.exists()
+        or groupedLogExists
     )
 
 
