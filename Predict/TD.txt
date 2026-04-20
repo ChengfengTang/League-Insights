@@ -9,10 +9,10 @@ we therefore formulate the task as discrete sequence classification: given recen
 game state, estimate a probability mass over map quadrants (or grid cells) for
 where the player will be at the next timestep (or over a small lookahead). A
 single “best” cell is optional—typically argmax or top-k from that distribution—
-because in reality several regions are often plausible. Data are assumed to come from match
-or replay-derived events aggregated to a fixed cadence (e.g., per minute) with
-interpolation where samples are missing, so each training example is a row or
-sequence ending at time t and a label for position at t + h.
+because in reality several regions are often plausible. Data are assumed to come
+from a merged timeline of regular frame snapshots plus sparse in-game events, so
+each training example is a row or sequence ending at time t and a label derived
+from the next chronological state in that merged stream.
 
 What we are measuring
 ---------------------
@@ -43,13 +43,15 @@ Formal task definition (enemy jungler pathing first)
 Primary scope for v1 is enemy-jungler path prediction during laning phase.
 We define:
 
-- t: current frame time in milliseconds.
-- h: prediction horizon (default h = 60000 ms).
+- r_t: the current row in the merged per-jungler sequence.
+- t: current row timestamp in milliseconds.
+- h_t: the row-specific prediction horizon, stored as `targetHorizonMs`.
 - T_lane: laning cutoff (default T_lane = 14 * 60 * 1000 ms).
-- x_t: feature vector at time t.
-- y_t: supervision target at time t + h (continuous or discretized).
-- m_t in {0,1}: validity mask, where m_t = 1 iff `targetValid` is true and
-  t <= T_lane.
+- x_t: feature vector at row r_t.
+- y_t: supervision target at the next chronological row r_(t+1), represented as
+  continuous coordinates/displacements or a discretized map cell.
+- m_t in {0,1}: validity mask, where m_t = 1 iff `targetX` and `targetY` are not
+  null and `timestampMs <= T_lane`.
 
 Per-row inclusion criterion:
   include row r_t <=> m_t = 1.
@@ -60,6 +62,12 @@ Target options:
 2) Discrete classification:
    y_t = c_t where c_t is a map cell / quadrant index derived from targetX/Y.
 
+Important dataset detail: the raw extractor no longer forces a fixed 60-second
+label. Instead, every row points to the next chronological row in the merged
+sequence. For plain `frame -> frame` transitions this is usually about one
+minute, but event rows (`kill`, `death`, `backing`, etc.) create shorter,
+semantically richer hops.
+
 The initial project decision is to start with enemy-jungler pathing only,
 then expand to recommendation tasks after the enemy-location baseline is stable.
 
@@ -68,7 +76,8 @@ Feature partition and notation
 We partition features into three groups:
 
 - Data evidence features D_t:
-  position/motion, level/xp/cs, hp/gold, event aggregates, side/champion.
+  position, level/cs/gold state, movement speed, row type, side/champion, and
+  sparse event semantics from the merged sequence.
 - Style-prior features P_t:
   champion playstyle category and suggested-clear-path signals
   (e.g., distance to suggested camp, clear prior score).
@@ -86,7 +95,7 @@ Important leakage rule:
 Laning-phase gating and masks
 -----------------------------
 Training mask:
-  m_t = 1[targetValid_t = 1 and timestampMs_t <= T_lane]
+  m_t = 1[targetX_t != null and targetY_t != null and timestampMs_t <= T_lane]
 
 Effective sample set:
   S = {t | m_t = 1}
@@ -214,170 +223,151 @@ How we will achieve it (implementation plan)
    `Data/players/<run>/` with **`username`** and **`tag`** per line; `fetchMatch.py`
    merges players by Riot ID, resolves **puuid** via the Account API, downloads
    flat `Data/matches/<run>/` and `Data/timelines/<run>/`, and **skips** a matchId
-   when match JSON, timeline JSON, or an existing `Data/log/<run>/<matchId>.jsonl`
-   is already on disk for that run. `processMatch.py` reads those pairs, writes
-   `Data/log/<run>/<matchId>.jsonl`, then **removes** the run’s `matches/` and
-   `timelines/` trees to save space. Optionally `sortLog.py` copies each log into
-   `Data/log (champions)/<junglerChampion>/<matchId>.jsonl` for champion-centric
-   tooling (same JSON shape as `processMatch` output).
+   when raw files already exist or when processing already produced either
+   `Data/log/<run>/.done/<matchId>` or grouped log files under
+   `Data/log/<run>/<ChampionName>/<matchId>_p<participantId>_<side>.json`.
+   `processMatch.py` reads each match/timeline pair and writes one pretty JSON
+   per jungler under the champion folder. After successful processing it touches
+   the empty `.done/<matchId>` marker and removes the raw match/timeline pair.
 
-   In the current `Data/processMatch.py` pipeline, each processed match is
-   written as `Data/log/<run>/<matchId>.jsonl` with three parts:
-   `matchContext`, `junglerTrainingRows`, and `events`. `matchContext` stores
-   the static information we know from champion select / loading screen or
-   match metadata: `matchId`, patch, queue/map, both teams, all participant
-   roles, summoner spells, and explicit blue/red jungler IDs/champions.
-   `junglerTrainingRows` is the main supervised table: one row per jungler per
-   frame containing current position, level, xp, current and total gold,
-   jungle/lane CS, hp and hp ratio, movement speed, recent deltas (`dx`, `dy`,
-   speed), nearby recent kill/death/objective pressure, objective recency, and
-   short-horizon future targets. `events` keeps only coordinate-bearing events
-   involving a jungler, mainly champion kills and epic monster kills, so we
-   retain spatial pressure signals while excluding non-spatial noise such as
-   `LEVEL_UP`. In practice, training uses `matchContext` as static conditioning,
-   `junglerTrainingRows` as the per-time-step input/label source, and `events`
-   as extra explanation for why a jungler changed route.
+   The current on-disk dataset contract is therefore:
+   `Data/log/<run>/<ChampionName>/<matchId>_p<participantId>_<blue|red>.json`
+   where each file contains one jungler only.
 
-Extracted features (reference table)
--------------------------------------
-Source: `Data/processMatch.py` → each match file is
-`Data/log/<run>/<matchId>.jsonl` with keys `matchContext`,
-`junglerTrainingRows`, `events`.
+Extracted features (current schema)
+-----------------------------------
+Source: `Data/processMatch.py` -> each processed file is
+`Data/log/<run>/<ChampionName>/<matchId>_p<participantId>_<side>.json`.
 
-A) matchContext (static, once per file)
-
-  Field / block              Contents (high level)
-  -------------------------  --------------------------------------------------
-  rowType                    Always `static_match_context`.
-  matchId                    Riot match id string.
-  gameVersion                Patch string.
-  queueId, mapId             Queue and map (filter SR ranked in fetch).
-  gameDuration               Match length (seconds); end-state from metadata.
-  gameStartTimestamp         Wall-clock start (ms) if present.
-  teams[]                    Per team: teamId, win (bool), objectives{}.
-  participants[]             Per player: participantId, teamId, championId,
-                             championName, teamPosition, individualPosition,
-                             lane, role, summoner1Id, summoner2Id.
-  blueJungler, redJungler    participantId + champion for each jungle.
-
-B) junglerTrainingRows[] (one object per jungler per timeline frame; rowType
-   `jungler_frame`)
+A) File header (constant per file)
 
   Field                      Contents
   -------------------------  --------------------------------------------------
-  Identity / static repeat   matchId, gameVersion, queueId, mapId,
-                             gameDuration, participantId, teamId,
-                             championId, championName, teamPosition,
-                             individualPosition, summoner1Id, summoner2Id
-  Time / index               frameIndex, timestampMs
-  Position                   x, y
-  Progression                level, xp, currentGold, totalGold, csJungle,
-                             csLane
-  Combat / mobility          hp, hpMax, hpRatio, movementSpeed,
-                             timeEnemySpentControlled
-  One-step motion (lag 1)    dx1, dy1, distance1, speedPerSec1, timeDeltaMs1
-                             (from previous frame; nulls on first frame)
-  Supervision (horizon)      targetHorizonMs (default 60000), targetValid,
-                             targetX, targetY, targetDx, targetDy
-  Event aggregates at t      nearbyChampionKillsLast60s,
-                             nearbyDeathsLast60s, nearbyObjectiveEventsLast90s,
-                             nearestChampionKillDistance,
-                             nearestObjectiveDistance,
-                             timeSinceLastDragonMs, timeSinceLastHeraldMs,
-                             timeSinceLastBaronMs, isBlueSide
+  matchId                    Riot match id string.
+  participantId              Jungler participant id for this file.
+  teamId                     100 or 200.
+  isBlueSide                 Boolean convenience flag (`teamId == 100`).
+  championId, championName   This jungler's champion.
+  enemyChampionId,
+  enemyChampionName          Opposing jungler champion identity.
 
-C) events[] (filtered list for file output)
+B) rows[] common fields (present on frame rows and event rows)
 
-  Only CHAMPION_KILL and ELITE_MONSTER_KILL with both x and y, and jungler
-  involved as killer, victim, or assist. Fields: timestampMs, type, x, y,
-  killerId; kills also victim, assists; objectives also monster,
-  monsterSubType.
+  Field                      Contents
+  -------------------------  --------------------------------------------------
+  rowType                    One of `frame`, `kill`, `assist`, `death`,
+                             `respawn`, `dragon`, `plate`, `backing`
+  frameIndex                 Unique sequential index in the merged row stream
+  timestampMs                Row timestamp in milliseconds
+  x, y                       Position for this row (event position or base)
+  level                      Level at/just before this row
+  targetHorizonMs            Milliseconds to the next chronological row
+  targetX, targetY           Position of the next chronological row
+  targetDx, targetDy         Displacement from current row to next row
 
-  Training rows still use the full event stream internally for the rolling
-  features above; this list is the human-readable / auxiliary sparse channel.
+  Terminal rows have null `target*` fields because there is no next row.
 
-Modeling notes: weights, motion ambiguity, gold, events
--------------------------------------------------------
+C) `frame` row fields
+
+  Field                      Contents
+  -------------------------  --------------------------------------------------
+  csJungle                   Jungle CS at that frame
+  csLane                     Lane CS at that frame
+  currentGold                Unspent gold at that frame
+  totalGold                  Total earned gold at that frame
+  movementSpeed              Current movement speed at that frame
+
+  The extractor intentionally keeps the frame schema small. Repeated metadata is
+  lifted into the file header rather than copied onto every row.
+
+D) Event row semantics
+
+  Row type                   Rule / source
+  -------------------------  --------------------------------------------------
+  kill                       `CHAMPION_KILL` where this jungler is killer
+  death                      `CHAMPION_KILL` where this jungler is victim
+  assist                     `CHAMPION_KILL` where this jungler assisted
+  dragon                     `ELITE_MONSTER_KILL` on a dragon with jungler
+                             involved as killer or assist; includes
+                             `monsterSubType`
+  plate                      `TURRET_PLATE_DESTROYED` where this jungler is
+                             killer; includes `laneType`
+  backing                    `ITEM_PURCHASED` for this jungler after leaving
+                             base; purchases within 15 seconds collapse into one
+                             shop visit
+  respawn                    Inferred base return after each `death`, using
+                             level-based respawn timing
+
+E) Ordering and supervision
+
+  Rows are sorted chronologically, with a stable type order for ties. After the
+  merge, `frameIndex` and all `target*` fields are recomputed so every row
+  points to the next chronological row in the final sequence. This is the key
+  difference from the older flat logs, where supervision was framed only as
+  "current frame -> next fixed 60 second frame."
+
+Legacy note:
+  Older flat `Data/log/<run>/<matchId>.jsonl` files can be converted only as a
+  best-effort backfill. They usually contain enough information for `frame`,
+  `kill`, `assist`, `death`, `dragon`, and inferred `respawn`, but they do not
+  preserve purchase events needed for the current `backing` rows and may also
+  miss plate events.
+
+Modeling notes: weights, motion, variable horizons, and sparse events
+---------------------------------------------------------------------
 These notes turn product intuition into experiment knobs (losses, weights,
 extra features). Nothing here requires changing the extractor unless we add
 new derived columns later.
 
-1) Sample weights: wins vs losses  
-   Idea: rows from matches where the jungler’s team won get higher weight than
+1) Sample weights: wins vs losses
+   Idea: rows from matches where the jungler's team won get higher weight than
    losses, so the model prefers trajectories that correlate with winning play.
-   How to derive offline: from `matchContext.teams`, find `win` for teamId
-   100 vs 200; assign each jungler row a binary `junglerTeamWon` matching that
-   jungler’s `teamId`. Per-example weight:
-     w = w_win  if junglerTeamWon else w_loss
-   with w_win > w_loss > 0 (e.g. start 1.5 vs 1.0; tune on val). Apply inside
-   the loss (multiply per-sample loss) or when aggregating gradients.
-   Caveat: `win` is end-of-game; it is not a live feature at minute t, but it
-   is legitimate for **offline** imitation-style weighting (“trust winning
-   paths more”). Do not feed `win` as an input feature if the product must
-   mimic live inference.
+   This should be an offline weighting only, never a live input feature.
 
-2) dx1, dy1, distance1, speedPerSec1, timeDeltaMs1 — what they are and limits  
-   They are **one backward step** on the timeline grid (typically ~60s apart):
-   displacement and speed from the immediately previous frame to the current.
-   They do **not** capture multi-minute intent; a jungler can reverse heading
-   between frames, so a single lag is a **noisy** cue. Mitigations:
-   - Stack several lags (dx2, dy2 over 2–3 frames) or feed a short sequence to
-     an RNN/Transformer instead of trusting only dx1.
-   - Treat one-step motion as a **weak** prior: pair with level/xp/cs and
-     objectives (below).
-   - For regression, use a loss that tolerates multimodality (Huber on error,
-     or discrete cells / mixture density) rather than assuming one direction
-     implies the next.
+2) Motion is now implicit, not precomputed
+   The current extractor no longer writes `dx1`, `dy1`, or speed deltas. If a
+   model wants short-history motion features, derive them in the dataloader from
+   consecutive `frame` rows or from the full merged sequence. This keeps the
+   on-disk schema lean and makes it easy to change lag windows later.
 
-3) Level timing, XP, jungle CS  
-   Strong signals for **path phase** and **style** (full clear vs heavy gank):
-   level jumps and XP curve vs game time; csJungle growth rate. Use deltas
-   (Δxp, ΔcsJungle over 1–3 frames) as features, not only levels. Align with
-   `targetHorizonMs` when building labels so phase is consistent.
+3) Level timing and jungle CS
+   `level` and `csJungle` remain strong signals for path phase and clear tempo.
+   Even without explicit XP columns, their progression over successive rows helps
+   distinguish full-clear, invade, reset, and fight-heavy branches.
 
-4) Movement speed  
-   Helps calibrate **how far** a champion can move per second between frames
-   when combined with `timeDeltaMs1`; also weak signal for slows / forms.
-   Useful as a continuous input; rarely worth a dedicated loss term.
+4) Gold and explicit back timing
+   `currentGold` and `totalGold` remain useful state features, but `backing` is
+   no longer inferred from gold drops. The extractor now uses `ITEM_PURCHASED`
+   events directly, which is strictly better for recall/shop timing.
 
-5) currentGold vs previous frame (recall / shop proxy)  
-   Define e.g. `deltaCurrentGold = currentGold_t - currentGold_{t-1}` (or ratio).
-   A **large negative** drop with no matching kill gold spike often correlates
-   with **spending on recall** (not deterministic). Use as one more scalar
-   feature; optional rule: cap or clip outliers. Product note: if the live
-   product never observes gold, train a variant without gold for deployment
-   parity.
+5) Sparse event rows are first-class signals
+   Instead of collapsing nearby events into coarse counts/distances, the current
+   dataset stores sparse rows directly in the main sequence. This makes event
+   transitions explicit and lets models learn patterns such as
+   `frame -> kill -> backing -> frame` or `frame -> death -> respawn -> frame`.
 
-6) Nearby events — direct jungler involvement vs “ambient” nearby  
-   Current row features **collapse** nearby kills and nearby objectives into
-   counts and distances; they do not separate “this jungler got the kill” vs
-   “fight two screens away.” Ways to sharpen signal:
-   - **Decompose** (future extractor or dataloader): counts where killerId or
-     victim or assists equal this jungler vs only distance-based “ambient.”
-   - **Distance decay**: weight events by 1 / (1 + dist) instead of hard radius
-     only, or use two radii (tight = committed, wide = macro pressure).
-   - **Ablation study**: train with event block on vs off; measure val gain.
-   - Use the `events[]` list for **auxiliary supervision** (e.g. predict next
-     jungler-touched kill location) if we want explicit gank localization.
+6) Variable horizon is part of the problem now
+   `targetHorizonMs` is no longer a constant label by construction. Downstream
+   training can:
+   - use it as an input,
+   - filter to a narrower horizon band,
+   - or resample to custom fixed-horizon tasks.
+   The raw log preserves the richer event-aware chronology first.
 
 Quantification (how to know these rules help)
-----------------------------------------------
-  - Win vs loss weights: grid-search (w_win, w_loss) on a **validation** split
-    by matchId; track mean distance error or grid log-loss **and** calibration.
-    Compare to w_win = w_loss baseline; stop if val worsens (overweighting
-    wins can bias toward passive paths).
-  - Motion / horizon: compare models with (a) position only, (b) +dx1/dy1,
-    (c) +multi-lag or sequence encoder; report same held-out metrics.
-  - Level / XP / csJungle: ablation removing progression block vs full model.
-  - movementSpeed: same ablation; expect small but consistent gain on
-    distance-normalized error if any.
-  - deltaCurrentGold: add as derived feature in the dataloader; ablation on/off;
-    inspect feature importance (tree) or gradient norms (NN).
-  - Events: train with rolling event features zeroed out vs full; optionally
-    add decomposed “jungler touched kill” counts and measure incremental val
-    gain.
-  - Rank / side (see below): report metrics **stratified** by ladder bucket and
-    by raw side vs canonicalized side, whenever those dimensions exist in the
+---------------------------------------------
+  - Win vs loss weights: grid-search on a validation split by `matchId`; track
+    mean distance error or grid log-loss and calibration.
+  - Motion features: compare models with only raw positions versus derived
+    multi-lag motion features from the dataloader.
+  - Level / CS / gold: ablation removing progression/economy blocks versus full
+    model.
+  - Sparse events: compare `frame`-only models against models that ingest the
+    merged event rows or event-derived summaries.
+  - Variable horizon handling: compare raw `targetHorizonMs` conditioning versus
+    filtered fixed-band training.
+  - Rank / side (see below): report metrics stratified by ladder bucket and by
+    raw side versus canonicalized side whenever those dimensions exist in the
     dataloader metadata.
 
 Training-data design choices (for publication / reproducibility)
@@ -396,7 +386,7 @@ A) Blue side vs red side — pool or split?
    half of the feature space). Apply the **same** transform to:
    - current `(x, y)` and supervision targets (`targetX`, `targetY`, `targetDx`,
      `targetDy`);
-   - any event coordinates used as inputs or auxiliary tasks (`events[]`).
+   - any event-row coordinates used as inputs or auxiliary tasks.
 
    The per-row flag `isBlueSide` (or `teamId`) can remain as an **optional**
    residual input **after** mirroring if ablations show real asymmetry (dragon
@@ -406,11 +396,10 @@ A) Blue side vs red side — pool or split?
    **Not recommended** unless data-rich and hypothesis-driven: entirely separate
    models per side (splits the dataset and hurts generalization).
 
-B) Rank / ladder — group logs by division or train together?  
-   On disk, logs live under `Data/log/<run>/<matchId>.jsonl` (flat per run); ladder
+B) Rank / ladder — group logs by division or train together?
+   On disk, logs now live under
+   `Data/log/<run>/<ChampionName>/<matchId>_p<participantId>_<side>.json`; ladder
    tier can be inferred from the run folder name or other metadata if needed.
-   For jungler-champion–bucketed copies (same file content, different layout), run
-   `Data/sortLog.py` to populate `Data/log (champions)/<champion>/<matchId>.jsonl`.
    **Training does not require** separate datasets per rank bucket.
 
    **Default:** concatenate **all ranks** when fitting a champion-centric or
