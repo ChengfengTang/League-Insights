@@ -1,0 +1,271 @@
+Current Roadmap: GRU Jungle Intent Model
+
+1. Goal
+
+The practical goal is:
+
+Given the recent chronological sequence of jungler frames and events, predict the
+next high-level destination region.
+
+This is an intent-classification problem, not an exact path reconstruction
+problem.
+
+The model should answer questions like:
+
+- Is this jungler continuing a farm route?
+- Is this jungler moving toward a lane gank?
+- Is this jungler shifting into river or enemy jungle pressure?
+
+
+2. What The Current Pipeline Actually Does
+
+The current codebase now uses a sequence pipeline end to end:
+
+- `Train/loadData.py` exports sequence shards under `Train/Input/<Champion>/`
+- `Train/train.py` trains a GRU on those saved sequence shards
+- The task is single-target 9-region classification
+
+Current region set:
+
+- `top_lane`
+- `mid_lane`
+- `bot_lane`
+- `red_top_jg`
+- `red_bot_jg`
+- `blue_top_jg`
+- `blue_bot_jg`
+- `top_river`
+- `bot_river`
+
+Current target rule:
+
+- for each row, predict the region of the next valid chronological row
+- skip targets whose next row is `backing` or `respawn`
+- keep match-level train/test split to avoid leakage
+
+This is intentionally simple and stable.
+
+
+3. Core Design Principle
+
+Do not try to reconstruct exact hidden jungle movement.
+
+That is:
+
+- impossible to recover perfectly from the available data
+- unnecessary for the current prediction target
+- likely to inject more label noise than signal
+
+The system should learn spatial intent, not exact micro-pathing.
+
+In practice, region prediction is a proxy for:
+
+- gank intent
+- farm continuation
+- invade pressure
+- river transition
+
+
+4. Available Signal
+
+The processed logs already contain useful behavior cues:
+
+- position `(x, y)`
+- timestamp
+- level
+- jungle CS
+- lane CS
+- current gold
+- total gold
+- movement speed
+- row type (`frame`, `kill`, `death`, `assist`, `dragon`, `plate`, `backing`, `respawn`)
+- lane / dragon subtype metadata
+- side / team context
+- champion and enemy champion context
+
+The current sequence exporter converts these into:
+
+- per-step numeric features
+- per-step categorical indices
+- fixed-length windows
+- a padding mask
+
+
+5. Current Input Representation
+
+Current numeric timestep features:
+
+- `x`
+- `y`
+- `timestampMinutes`
+- `phase01`
+- `level`
+- `csJungle`
+- `csLane`
+- `currentGold`
+- `totalGold`
+- `movementSpeed`
+- `frameIndex`
+- distances to own base / enemy base / center
+- normalized versions of those distances
+- `positionKnown`
+- `positionImputed`
+- `prevDtSeconds`
+- `prevDx`
+- `prevDy`
+- `prevDistance`
+- `prevSpeed`
+
+Current categorical timestep/context features:
+
+- row type
+- lane type
+- dragon subtype
+- side
+- champion category
+- enemy champion category
+
+Current sequence length:
+
+- 16 timesteps
+
+Current model:
+
+- 1-layer GRU
+- hidden size 128
+- embedding size 8
+
+
+6. What Is Working Right Now
+
+The GRU already beats the old SGD baseline clearly.
+
+That means:
+
+- the sequence framing is useful
+- the current 9-region target is learnable
+- keeping explicit event rows in the timeline helps
+- even a simple recurrent model can extract intent from this representation
+
+So the next stage should focus on improving the current GRU system, not going
+back to SGD.
+
+
+7. What To Avoid Right Now
+
+Do not prioritize these yet:
+
+- exact coordinate prediction
+- fine-grained synthetic interpolation
+- path reconstruction heuristics
+- switching immediately to a transformer
+
+Why:
+
+- these add complexity before the current target is saturated
+- they can create label noise
+- they make debugging harder
+
+The current system is strong enough to justify tuning the existing setup first.
+
+
+8. Immediate Tuning Priorities
+
+Priority 1: Better sequence context
+
+- increase window size from 16 to 32
+- compare 16 / 24 / 32
+- check whether longer windows help early-game route inference
+
+Priority 2: Better derived features
+
+Add more behavior-oriented signals directly into each timestep:
+
+- delta jungle CS since previous step
+- delta total gold since previous step
+- normalized movement direction
+- distance-per-CS proxy
+- distance-per-gold proxy
+- event recency features (time since death / kill / dragon / backing)
+
+Priority 3: Better training stability
+
+- tune batch size
+- tune learning rate
+- tune hidden size
+- possibly add gradient clipping
+- test mild dropout changes
+
+Priority 4: Better target framing
+
+Before multi-horizon, first make the current single-step target as clean as
+possible.
+
+That means:
+
+- confirm the 9 regions are still the right partition
+- inspect confusion between nearby classes like river vs jungle
+- check whether some event rows should be down-weighted or filtered
+
+
+9. Medium-Term Upgrades
+
+Once the current GRU is tuned and stable:
+
+Option A: GRU + attention
+
+- keep GRU for local sequence modeling
+- add attention to highlight important past timesteps
+- likely the best next architectural step
+
+Option B: Multi-horizon supervision
+
+- predict 10s / 30s / 60s intent simultaneously
+- only after the labeling rule is defined cleanly
+- useful if the single-step next-row target proves too local
+
+Important:
+
+Multi-horizon is promising, but it needs an exact deterministic target rule
+before implementation. Otherwise it will make training noisier, not better.
+
+
+10. Long-Term Direction
+
+A transformer may eventually be useful, but only after:
+
+- the current target definition is stable
+- the current GRU features are mature
+- the benefit of longer context is clearly established
+
+Right now, transformer is not the bottleneck.
+Data quality, feature design, and target quality matter more.
+
+
+11. Working Philosophy
+
+The practical philosophy should be:
+
+- predict intent, not coordinates
+- use real logged rows and events first
+- prefer clean labels over clever modeling
+- tune the current GRU before changing architecture
+- add complexity only when the simpler version is clearly saturated
+
+
+12. Final Summary
+
+The current system should be treated as:
+
+past sequence of game state and events -> next spatial intent region
+
+This is already the right framing.
+
+The next gains should come from:
+
+- stronger derived sequence features
+- longer or better-tuned context windows
+- cleaner target design
+- modest GRU improvements
+
+Not from trying to reconstruct exact jungle paths.

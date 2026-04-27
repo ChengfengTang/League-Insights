@@ -209,7 +209,7 @@ def fetchMatchIds(matchCluster: str, puuid: str, count: int) -> List[str]:
 
 def saveJson(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
 
 def readJson(path: Path) -> Optional[Dict[str, Any]]:
@@ -232,18 +232,15 @@ def matchAlreadyStoredOrProcessed(dataDirPath: Path, runName: str, matchId: str)
       - Data/matches/<run>/<matchId>.json
       - Data/timelines/<run>/<matchId>_timeline.json
       - Data/log/<run>/.done/<matchId>
-      - Data/log/<run>/<ChampionName>/<matchId>_p<participantId>_<side>.json
     """
     matchPath = dataDirPath / "matches" / runName / f"{matchId}.json"
     timelinePath = dataDirPath / "timelines" / runName / f"{matchId}_timeline.json"
     logRunDir = dataDirPath / "log" / runName
     doneMarkerPath = logRunDir / ".done" / matchId
-    groupedLogExists = any(logRunDir.glob(f"*/{matchId}_p*_*.json"))
     return (
         matchPath.exists()
         or timelinePath.exists()
         or doneMarkerPath.exists()
-        or groupedLogExists
     )
 
 

@@ -8,7 +8,9 @@ Data/log (champions)/
 # Live 
 Live/
 
-# Predict
+# Train
+Train/Input/
+Train/models/
 
 
 # Python

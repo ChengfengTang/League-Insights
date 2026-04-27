@@ -154,6 +154,8 @@ let participantsById = {};
 let lastRenderedCanvasPosByPid = {}; // participantId -> { x, y, wasDeadVisual, t }
 let movementSegments = []; // [{ x1, y1, x2, y2, createdAt }]
 const MOVEMENT_SEGMENT_TTL = 20; // in game-seconds
+const BACKING_MIN_DEPARTURE_DISTANCE = 1800.0;
+const BACKING_PURCHASE_MERGE_WINDOW_MS = 15000;
 
 function msToMinSec(ms) {
   const m = Math.floor(ms / 60000);
@@ -204,6 +206,10 @@ function togglePlayPause() {
 
 function getBasePosition(team) {
   return team === "Blue" ? { x: 554, y: 581 } : { x: 14500, y: 14511 };
+}
+
+function getBasePositionByTeamId(teamId) {
+  return teamId === 100 ? getBasePosition("Blue") : getBasePosition("Red");
 }
 
 function isNearBaseCanvasPosition(x, y, team) {
@@ -267,7 +273,10 @@ function getLatestRelevantEventPosition(participantId, t) {
       latest = e;
       continue;
     }
-    if (e.type === "ELITE_MONSTER_KILL" && e.killerId === participantId) {
+    if ((e.type === "ELITE_MONSTER_KILL" || e.type === "DRAGON" || e.type === "PLATE") && e.killerId === participantId) {
+      latest = e;
+    }
+    if (e.type === "BACKING" && e.participantId === participantId) {
       latest = e;
     }
   }
@@ -278,6 +287,56 @@ function participantJitterSeed(participantId) {
   // Deterministic small seed so overlapping icons spread consistently.
   const n = Number(participantId) || 0;
   return (n * 2654435761) >>> 0;
+}
+
+function inferBackingEvents(purchasesByPid, framesByPid, respawnTimesByPid) {
+  const inferred = [];
+  for (const [pidText, purchases] of Object.entries(purchasesByPid)) {
+    const participantId = Number(pidText);
+    const participant = participantsById[participantId];
+    if (!participant || purchases.length === 0) continue;
+
+    const basePos = getBasePositionByTeamId(participant.teamId);
+    const frames = (framesByPid[participantId] || []).slice().sort((a, b) => a.timeSeconds - b.timeSeconds);
+    const respawnTimes = (respawnTimesByPid[participantId] || []).slice().sort((a, b) => a - b);
+    const sortedPurchases = purchases.slice().sort((a, b) => a.timestampMs - b.timestampMs);
+    let lastBackingTs = null;
+
+    for (const purchase of sortedPurchases) {
+      const ts = purchase.timestampMs;
+      if (lastBackingTs !== null && ts - lastBackingTs <= BACKING_PURCHASE_MERGE_WINDOW_MS) {
+        continue;
+      }
+
+      let prior = null;
+      for (const frame of frames) {
+        if ((frame.timeSeconds * 1000) <= ts) prior = frame;
+        else break;
+      }
+      if (!prior) continue;
+
+      const distanceFromBase = Math.hypot(prior.x - basePos.x, prior.y - basePos.y);
+      if (distanceFromBase < BACKING_MIN_DEPARTURE_DISTANCE) continue;
+
+      const overlapsRespawn = respawnTimes.some(
+        (respawnTs) => ts <= respawnTs && respawnTs <= ts + BACKING_PURCHASE_MERGE_WINDOW_MS
+      );
+      if (overlapsRespawn) continue;
+
+      lastBackingTs = ts;
+      const tSeconds = ts / 1000;
+      const champ = champMap[participantId];
+      inferred.push({
+        time: secondsToMinSec(tSeconds),
+        timeSeconds: tSeconds,
+        type: "BACKING",
+        position: basePos,
+        participantId,
+        event: `🏪 ${label(champ)} backed and shopped`
+      });
+    }
+  }
+  return inferred;
 }
 
 function buildLiveKdaByParticipant(t) {
@@ -398,13 +457,25 @@ async function fetchData() {
       });
     }
 
+    const framesByPid = {};
+    const purchasesByPid = {};
+    const respawnTimesByPid = {};
+
     for (const frame of timeline.info.frames) {
       const timeSec = frame.timestamp / 1000;
       if (timeSec > maxGameTime) maxGameTime = timeSec;
       for (const [pid, pf] of Object.entries(frame.participantFrames)) {
         if (!pf.position) continue;
+        const participantId = parseInt(pid);
+        if (!framesByPid[participantId]) framesByPid[participantId] = [];
+        framesByPid[participantId].push({
+          timeSeconds: timeSec,
+          x: pf.position.x,
+          y: pf.position.y,
+          level: pf.level || 1
+        });
         junglerData.push({
-          id: parseInt(pid),
+          id: participantId,
           time: msToMinSec(frame.timestamp),
           timeSeconds: timeSec,
           x: pf.position.x,
@@ -464,6 +535,8 @@ async function fetchData() {
             team: champMap[event.victimId].team,
             deathPosition: event.position || null
           });
+          if (!respawnTimesByPid[event.victimId]) respawnTimesByPid[event.victimId] = [];
+          respawnTimesByPid[event.victimId].push(respawnTimeSec * 1000);
 
           // Add assist events
           for (const a of (event.assistingParticipantIds || [])) {
@@ -484,8 +557,38 @@ async function fetchData() {
         } else if (type === "ELITE_MONSTER_KILL") {
           const killer = champMap[event.killerId];
           const monster = event.monsterType;
+          if (killer && monster === "DRAGON") {
+            events.push({
+              time: eventTimeStr,
+              timeSeconds: eventTimeSec,
+              type: "DRAGON",
+              position: event.position,
+              killerId: event.killerId,
+              assistingParticipantIds: event.assistingParticipantIds || [],
+              event: `🐉 ${label(killer)} secured ${event.monsterSubType || "Dragon"} at (${event.position?.x}, ${event.position?.y})`
+            });
+          }
+        } else if (type === "TURRET_PLATE_DESTROYED") {
+          const killer = champMap[event.killerId];
           if (killer) {
-            events.push({ time: eventTimeStr, timeSeconds: eventTimeSec, event: `👾 ${label(killer)} killed ${monster} at (${event.position?.x}, ${event.position?.y})` });
+            events.push({
+              time: eventTimeStr,
+              timeSeconds: eventTimeSec,
+              type: "PLATE",
+              position: event.position,
+              killerId: event.killerId,
+              laneType: event.laneType,
+              event: `🛡️ ${label(killer)} took turret plate (${event.laneType || "UNKNOWN"}) at (${event.position?.x}, ${event.position?.y})`
+            });
+          }
+        } else if (type === "ITEM_PURCHASED") {
+          const purchaserId = event.participantId;
+          if (purchaserId && champMap[purchaserId]) {
+            if (!purchasesByPid[purchaserId]) purchasesByPid[purchaserId] = [];
+            purchasesByPid[purchaserId].push({
+              timestampMs: event.timestamp,
+              itemId: event.itemId
+            });
           }
         } else if (type === "LEVEL_UP") {
           const champ = champMap[event.participantId];
@@ -496,6 +599,12 @@ async function fetchData() {
         }
       }
     }
+
+    const inferredBackingEvents = inferBackingEvents(purchasesByPid, framesByPid, respawnTimesByPid);
+    for (const backingEvent of inferredBackingEvents) {
+      events.push(backingEvent);
+    }
+    events.sort((a, b) => a.timeSeconds - b.timeSeconds);
 
     console.log("✅ Data loaded:", junglerData.length, "points,", events.length, "events");
     document.getElementById('timeSlider').max = maxGameTime;

@@ -4,6 +4,8 @@ This module categorizes champions by their jungler playstyle for prediction purp
 Categories are used to train separate models or apply category-specific logic.
 """
 
+from __future__ import annotations
+
 # Champion categorization by jungler playstyle
 CHAMPION_CATEGORIES = {
     # Aggressive - Early game gankers, strong early pressure
